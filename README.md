@@ -109,6 +109,7 @@ Microsoft TypeAgent Repo is a mono-repo, with components organized with the foll
 - [`python`](./python) Python code ([Readme](./python/README.md))
 - [`dotnet`](./dotnet) Dotnet (C#) code ([Readme](./dotnet/README.md))
 - [`android`](./android/) Android (Kotlin/Java) code ([Readme](./android/README.md))
+- [`go`](./go) Go code ([Readme](./go/README.md))
 
 See more information about working with the repo [here](./docs/content/help/dev.md).
 

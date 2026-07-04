@@ -1,0 +1,555 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+kind: taskpilot
+version: 1
+requiresEngine: ">=0.1.0 <0.2.0"
+entry: selfReview
+
+# Multiagent self-review "ratchet" workflow for the taskpilot Go codebase.
+#
+# Six design axes (R1..R6) are reviewed in parallel, each by an isolated
+# sub-workflow that fans out one reviewer agent per file and then runs an
+# anti-oscillation guard over that axis's findings against an append-only
+# decision log. The per-axis ranked
+# candidates are merged (deduped by fix target, ordered R1..R6, capped), then a
+# SEQUENTIAL ratchet loop applies one candidate at a time: fix -> re-probe ->
+# objective gate -> git commit (accept) or git reset --hard (reject) -> append
+# decision log. The gate floors on `go build`/`go test` staying green and
+# covered-line + test counts not dropping; other proxy metrics are advisory.
+#
+# All review and guard steps are read-only, so the six axis subgraphs run in
+# parallel safely; only the ratchet loop mutates the tree, and it is serial.
+#
+# Every input has a default, so the workflow runs with no flags; an empty
+# --root falls back to the git toplevel of the working directory:
+#
+#   tp verify examples/self-review/self-review.yaml
+#   tp run examples/self-review/self-review.yaml
+#
+# Any default can be overridden per flag, e.g.:
+#
+#   tp run examples/self-review/self-review.yaml \
+#     --root D:\taskpoint --pattern "{cmd,internal}/**/*.go" \
+#     --reviewModel claude-sonnet-4-6 --guardModel claude-sonnet-4-6 \
+#     --fixModel claude-opus-4.6 --maxCandidates 10
+
+constants:
+  # The six ratchet axes, ordered by application priority (structural -> cosmetic).
+  # `id` keys the rubric file and the decision log; `rubric` is the rubric path
+  # relative to root; `wholeRepo` flags axes whose reviewer greps the whole
+  # tree (R2 semantic dedup, R6 documentation sync). `coverExt` selects the
+  # per-file coverage fragment each axis's reviewer consumes: only R1 (dead
+  # code) uses coverage, so it maps to the real ".cover" fragment; every other
+  # axis maps to ".none", an absent file whose stable "absent" fingerprint keeps
+  # those reviewers decoupled from coverage churn (so a coverage-only change
+  # never busts their cross-run cache).
+  axes:
+    value:
+      - id: R1
+        title: "Dead code / reduced complexity"
+        rubric: "examples/self-review/prompts/rubrics/R1.md"
+        wholeRepo: false
+        coverExt: "cover"
+      - id: R2
+        title: "Single source of truth (semantic dedup)"
+        rubric: "examples/self-review/prompts/rubrics/R2.md"
+        wholeRepo: true
+        coverExt: "none"
+      - id: R3
+        title: "Maintainability / coupling"
+        rubric: "examples/self-review/prompts/rubrics/R3.md"
+        wholeRepo: false
+        coverExt: "none"
+      - id: R4
+        title: "Correctness-by-construction"
+        rubric: "examples/self-review/prompts/rubrics/R4.md"
+        wholeRepo: false
+        coverExt: "none"
+      - id: R5
+        title: "Testability without leaking"
+        rubric: "examples/self-review/prompts/rubrics/R5.md"
+        wholeRepo: false
+        coverExt: "none"
+      - id: R6
+        title: "Documentation sync / comment-code consistency"
+        rubric: "examples/self-review/prompts/rubrics/R6.md"
+        wholeRepo: true
+        coverExt: "none"
+
+  # Guidance schema the reviewer agent is asked to emit (one object per file).
+  findingsSchema:
+    value:
+      type: object
+      required: [file, candidates]
+      properties:
+        file: { type: string }
+        candidates:
+          type: array
+          items:
+            type: object
+            required: [id, axis, reviewTarget, fixTarget, summary, confidence]
+            properties:
+              id: { type: string }
+              axis: { type: string }
+              reviewTarget: { type: string }
+              fixTarget: { type: string }
+              summary: { type: string }
+              ratchetDelta: { type: string }
+              confidence: { type: number }
+              evidence: { type: array, items: { type: string } }
+
+  # Guidance schema the anti-oscillation guard agent is asked to emit for its axis.
+  candidatesSchema:
+    value:
+      type: object
+      required: [candidates]
+      properties:
+        candidates:
+          type: array
+          items:
+            type: object
+            required: [id, axis, fixTarget, title, confidence]
+            properties:
+              id: { type: string }
+              axis: { type: string }
+              fixTarget: { type: string }
+              title: { type: string }
+              summary: { type: string }
+              ratchetDelta: { type: string }
+              confidence: { type: number }
+
+tasks:
+  # =====================================================================
+  # Entry: orchestrate baseline -> parallel review -> merge -> ratchet loop.
+  # =====================================================================
+  selfReview:
+    inputSchema:
+      type: object
+      required: [root, pattern, reviewModel, guardModel, fixModel, maxCandidates]
+      properties:
+        # root defaults to "" and is resolved to the git toplevel by resolveRoot.
+        root: { type: string, default: "" }
+        pattern: { type: string, default: "{cmd,internal}/**/*.go" }
+        reviewModel: { type: string, default: "auto" }
+        guardModel: { type: string, default: "auto" }
+        fixModel: { type: string, default: "claude-opus-4.8" }
+        maxCandidates: { type: integer, default: 10 }
+    outputSchema:
+      type: object
+      required: [preflight, baseline, ranked, ratchet]
+      properties:
+        preflight: { type: object }
+        baseline: { type: object }
+        ranked: { type: object }
+        ratchet: {}
+    graph:
+      nodes:
+        # Resolve the repo root once: use --root when given, else fall back to
+        # the git toplevel of the working directory (the default). Runs in the
+        # process CWD (no cwd) so git can locate the repo before the root is
+        # known; every downstream node reads {result, root} from here.
+        #
+        # Threads runId (as an unused $args[1]) purely to opt out of caching:
+        # the resolved root depends on ambient state (the invocation's CWD / git
+        # toplevel) that the cache key cannot capture, so without this a stale
+        # entry -- e.g. a root from a previous location of this repo -- would be
+        # replayed on a cache hit instead of re-resolving.
+        resolveRoot:
+          task: pwsh.run
+          inputs:
+            script: "$r = $args[0]; if ([string]::IsNullOrWhiteSpace($r)) { $r = (& git rev-parse --show-toplevel 2>$null); if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($r)) { throw 'root not provided and current directory is not a git repository' } }; [pscustomobject]@{ root = $r.Trim() } | ConvertTo-Json -Compress"
+            args:
+              - { $from: input, name: root }
+              - { $from: run, name: id }
+            dryRunStdout: '{"root":"."}'
+          outputSchema: { type: object }
+
+        # Assert a clean tree, create the run branch + dirs, verify tooling.
+        # A non-zero exit fails the run, so missing go/git stop us up front.
+        preflight:
+          task: pwsh.run
+          inputs:
+            script: "& (Join-Path $args[0] 'examples/self-review/scripts/Test-Preflight.ps1') -RepoRoot $args[0] -RunNonce $args[1]"
+            args:
+              - { $from: node, node: resolveRoot, path: [result, root] }
+              - { $from: run, name: id }
+            cwd: { $from: node, node: resolveRoot, path: [result, root] }
+            dryRunStdout: '{"ok":true,"branch":"selfreview/dry","runDir":".tmp/selfreview/dry","logPath":".tmp/selfreview/applied-changes.md"}'
+          outputSchema: { type: object }
+
+        # Objective baseline metrics snapshot the gate compares against.
+        baseline:
+          task: pwsh.run
+          inputs:
+            script: "& (Join-Path $args[0] 'examples/self-review/scripts/Invoke-Probe.ps1') -RepoRoot $args[0] -RunDir $args[1] -Label baseline"
+            args:
+              - { $from: node, node: resolveRoot, path: [result, root] }
+              - { $from: node, node: preflight, path: [result, runDir] }
+            cwd: { $from: node, node: resolveRoot, path: [result, root] }
+            timeoutSeconds: 1800
+            dryRunStdout: '{"buildOk":true,"testOk":true,"coveredLines":0,"coverProfile":".tmp/selfreview/baseline.cover.out","testCount":0,"vetCount":0,"exportedCount":0,"gocycloOver":0,"deadcodeCount":0,"globalVarCount":0,"outFile":".tmp/selfreview/dry/baseline.json"}'
+          outputSchema: { type: object }
+
+        # Enumerate the Go files to review. file.glob is content-addressed, so an
+        # unchanged file set cache-hits the whole review subtree on re-runs.
+        discover:
+          task: file.glob
+          inputs:
+            root: { $from: node, node: resolveRoot, path: [result, root] }
+            pattern: { $from: input, name: pattern }
+          outputSchema:
+            type: array
+            items: { type: object }
+
+        # Fingerprint the baseline coverage profile so the split below is
+        # content-addressed on its bytes: passing this ref (not the bare path)
+        # as the splitter's profile arg means the split re-runs only when
+        # coverage actually changed, even though baseline rewrites the profile
+        # every run.
+        coverProfileRef:
+          task: file.ref
+          inputs:
+            path: { $from: node, node: baseline, path: [result, coverProfile] }
+          outputSchema: { type: object }
+
+        # Stable directory the per-file coverage fragments live under. It is
+        # shared across runs on purpose: file.ref keys reviewers on fragment
+        # CONTENT, not on a per-run path, which is what lets unchanged coverage
+        # cache-hit between runs.
+        coverDir:
+          task: path.join
+          inputs:
+            parts:
+              - { $from: node, node: resolveRoot, path: [result, root] }
+              - ".tmp/selfreview/cover"
+          outputSchema: { type: string }
+
+        # Split the whole-module profile into one sorted fragment per source
+        # file, so each R1 reviewer consumes ONLY its file's coverage via a
+        # content-addressed file.ref (see reviewOneFile). Sorted output keeps a
+        # fragment byte-identical when its file's coverage is unchanged, so a
+        # reviewer skips unless its own coverage moved.
+        splitCoverage:
+          task: pwsh.run
+          inputs:
+            script: "& (Join-Path $args[0] 'examples/self-review/scripts/Split-Coverage.ps1') -RepoRoot $args[0] -CoverProfile $args[1] -CoverDir $args[2]"
+            args:
+              - { $from: node, node: resolveRoot, path: [result, root] }
+              - { $from: node, node: coverProfileRef }
+              - { $from: node, node: coverDir }
+            cwd: { $from: node, node: resolveRoot, path: [result, root] }
+            dryRunStdout: '{"coverDir":".tmp/selfreview/cover","files":0}'
+          outputSchema: { type: object }
+
+        # One isolated, read-only review sub-workflow per axis, in parallel.
+        reviewAxes:
+          task: reviewAxis
+          forEach:
+            items: { $from: constant, name: axes }
+            maxConcurrency: 6
+          inputs:
+            root: { $from: node, node: resolveRoot, path: [result, root] }
+            axis: { $from: item }
+            files: { $from: node, node: discover }
+            model: { $from: input, name: reviewModel }
+            guardModel: { $from: input, name: guardModel }
+            logPath: { $from: node, node: preflight, path: [result, logPath] }
+            runDir: { $from: node, node: preflight, path: [result, runDir] }
+            coverDir: { $from: node, node: splitCoverage, path: [result, coverDir] }
+
+        # Combine per-axis candidates: dedup by fixTarget, order R1..R6, cap.
+        merge:
+          task: pwsh.run
+          dependsOn: [reviewAxes]
+          inputs:
+            script: "& (Join-Path $args[0] 'examples/self-review/scripts/Merge-Candidates.ps1') -RepoRoot $args[0] -RunDir $args[1] -MaxCandidates $args[2]"
+            args:
+              - { $from: node, node: resolveRoot, path: [result, root] }
+              - { $from: node, node: preflight, path: [result, runDir] }
+              - { $from: input, name: maxCandidates }
+            cwd: { $from: node, node: resolveRoot, path: [result, root] }
+            dryRunStdout: '{"count":0,"iterations":1,"rankedFile":".tmp/selfreview/dry/ranked.json"}'
+          outputSchema: { type: object }
+
+        # Apply candidates one at a time, gating each against the baseline.
+        ratchetLoop:
+          loop:
+            maxIterations: { $from: node, node: merge, path: [result, iterations] }
+            bodyTask: applyOneCandidate
+            inputs:
+              root: { $from: node, node: resolveRoot, path: [result, root] }
+              model: { $from: input, name: fixModel }
+              runDir: { $from: node, node: preflight, path: [result, runDir] }
+              baselineFile: { $from: node, node: baseline, path: [result, outFile] }
+              rankedFile: { $from: node, node: merge, path: [result, rankedFile] }
+              total: { $from: node, node: merge, path: [result, count] }
+              logPath: { $from: node, node: preflight, path: [result, logPath] }
+              index: { $from: index }
+            continueWhen: { $from: body, path: [shouldContinue] }
+      output:
+        preflight: { $from: node, node: preflight, path: [result] }
+        baseline: { $from: node, node: baseline, path: [result] }
+        ranked: { $from: node, node: merge, path: [result] }
+        ratchet: { $from: node, node: ratchetLoop }
+
+  # =====================================================================
+  # Per-axis isolated review subgraph (read-only): fan out a reviewer per
+  # file, then run the anti-oscillation guard over this axis's findings against
+  # the decision log.
+  # =====================================================================
+  reviewAxis:
+    inputSchema: { type: object }
+    outputSchema: { type: object }
+    graph:
+      nodes:
+        reviewFiles:
+          task: reviewOneFile
+          forEach:
+            items: { $from: input, name: files }
+          inputs:
+            root: { $from: input, name: root }
+            axis: { $from: input, name: axis }
+            file: { $from: item }
+            model: { $from: input, name: model }
+            coverDir: { $from: input, name: coverDir }
+
+        guardPromptPath:
+          task: path.join
+          inputs:
+            parts:
+              - { $from: input, name: root }
+              - "examples/self-review/prompts/guard.md"
+          outputSchema: { type: string }
+
+        readLog:
+          task: file.ref
+          inputs:
+            path: { $from: input, name: logPath }
+          outputSchema: { type: object }
+
+        stringifyFindings:
+          task: json.stringify
+          inputs:
+            value: { $from: node, node: reviewFiles }
+            indent: 2
+          outputSchema: { type: string }
+
+        renderGuard:
+          task: template.expand
+          inputs:
+            templatePath: { $from: node, node: guardPromptPath }
+            vars:
+              axisTitle: { $from: input, name: axis, path: [title] }
+              axisId: { $from: input, name: axis, path: [id] }
+              findings: { $from: node, node: stringifyFindings }
+              decisionLog: { $from: node, node: readLog }
+          outputSchema: { type: string }
+
+        guard:
+          task: copilot.invoke
+          inputs:
+            prompt: { $from: node, node: renderGuard }
+            model: { $from: input, name: guardModel }
+            workingDirectory: { $from: input, name: root }
+            permissionMode: approveAll
+            expectJson: false
+            sessionIdleTimeoutSeconds: 1800
+            outputSchema: { $from: constant, name: candidatesSchema }
+
+        candidatesPath:
+          task: template.expand
+          inputs:
+            template: "{{runDir}}/issues/{{axis}}.candidates.json"
+            vars:
+              runDir: { $from: input, name: runDir }
+              axis: { $from: input, name: axis, path: [id] }
+          outputSchema: { type: string }
+
+        stringifyCandidates:
+          task: json.stringify
+          inputs:
+            value: { $from: node, node: guard }
+            indent: 2
+          outputSchema: { type: string }
+
+        writeCandidates:
+          task: file.write
+          inputs:
+            path: { $from: node, node: candidatesPath }
+            content: { $from: node, node: stringifyCandidates }
+          outputSchema: { type: string }
+      output:
+        axis: { $from: input, name: axis, path: [id] }
+        candidatesFile: { $from: node, node: writeCandidates }
+
+  # =====================================================================
+  # Review one file against one axis rubric. Returns the raw JSON findings
+  # string the anti-oscillation guard step parses.
+  # =====================================================================
+  reviewOneFile:
+    inputSchema: { type: object }
+    outputSchema: { type: object }
+    graph:
+      nodes:
+        rubricPath:
+          task: path.join
+          inputs:
+            parts:
+              - { $from: input, name: root }
+              - { $from: input, name: axis, path: [rubric] }
+          outputSchema: { type: string }
+
+        # Path to THIS file's coverage fragment for THIS axis. Only R1 sets
+        # coverExt="cover", pointing at the real fragment the splitter wrote;
+        # every other axis sets coverExt="none", pointing at an absent file so
+        # its file.ref below yields the stable "absent" fingerprint and never
+        # couples that reviewer to coverage churn.
+        coveragePath:
+          task: template.expand
+          inputs:
+            template: "{{coverDir}}/{{file}}.{{coverExt}}"
+            vars:
+              coverDir: { $from: input, name: coverDir }
+              file: { $from: input, name: file, path: [relPath] }
+              coverExt: { $from: input, name: axis, path: [coverExt] }
+          outputSchema: { type: string }
+
+        # Content-addressed reference to the fragment. Its fingerprint folds
+        # into readRubric -> renderPrompt -> invoke, so the R1 reviewer re-runs
+        # iff its file's coverage bytes changed, and cache-hits otherwise.
+        coverageRef:
+          task: file.ref
+          inputs:
+            path: { $from: node, node: coveragePath }
+          outputSchema: { type: object }
+
+        readRubric:
+          task: template.expand
+          inputs:
+            templatePath: { $from: node, node: rubricPath }
+            vars:
+              coverProfile: { $from: node, node: coverageRef }
+          outputSchema: { type: string }
+
+        promptPath:
+          task: path.join
+          inputs:
+            parts:
+              - { $from: input, name: root }
+              - "examples/self-review/prompts/reviewer.md"
+          outputSchema: { type: string }
+
+        content:
+          task: file.ref
+          inputs:
+            path: { $from: input, name: file, path: [path] }
+          outputSchema: { type: object }
+
+        renderPrompt:
+          task: template.expand
+          inputs:
+            templatePath: { $from: node, node: promptPath }
+            vars:
+              axisTitle: { $from: input, name: axis, path: [title] }
+              axisId: { $from: input, name: axis, path: [id] }
+              rubric: { $from: node, node: readRubric }
+              file: { $from: input, name: file, path: [relPath] }
+              source: { $from: node, node: content }
+              root: { $from: input, name: root }
+          outputSchema: { type: string }
+
+        invoke:
+          task: copilot.invoke
+          inputs:
+            prompt: { $from: node, node: renderPrompt }
+            model: { $from: input, name: model }
+            workingDirectory: { $from: input, name: root }
+            permissionMode: approveAll
+            expectJson: false
+            sessionIdleTimeoutSeconds: 1800
+            outputSchema: { $from: constant, name: findingsSchema }
+      output:
+        file: { $from: input, name: file, path: [relPath] }
+        finding: { $from: node, node: invoke }
+
+  # =====================================================================
+  # Apply one ranked candidate, gate it, and accept (commit) or reject
+  # (revert). Returns shouldContinue for the loop.
+  # =====================================================================
+  applyOneCandidate:
+    inputSchema: { type: object }
+    outputSchema: { type: object }
+    graph:
+      nodes:
+        pick:
+          task: pwsh.run
+          inputs:
+            script: "& (Join-Path $args[0] 'examples/self-review/scripts/Pick-NextCandidate.ps1') -RepoRoot $args[0] -RankedFile $args[1] -Index $args[2]"
+            args:
+              - { $from: input, name: root }
+              - { $from: input, name: rankedFile }
+              - { $from: input, name: index }
+            cwd: { $from: input, name: root }
+            dryRunStdout: '{"candidate":{},"title":"none","axis":"R0","hasCandidate":false,"total":0}'
+          outputSchema: { type: object }
+
+        fixPromptPath:
+          task: path.join
+          inputs:
+            parts:
+              - { $from: input, name: root }
+              - "examples/self-review/prompts/fix.md"
+          outputSchema: { type: string }
+
+        readFixPrompt:
+          task: template.expand
+          inputs:
+            templatePath: { $from: node, node: fixPromptPath }
+            vars:
+              axis: { $from: node, node: pick, path: [result, axis] }
+              title: { $from: node, node: pick, path: [result, title] }
+              candidate: { $from: node, node: stringifyCandidate }
+              hasCandidate: { $from: node, node: pick, path: [result, hasCandidate] }
+          outputSchema: { type: string }
+
+        stringifyCandidate:
+          task: json.stringify
+          inputs:
+            value: { $from: node, node: pick, path: [result, candidate] }
+            indent: 2
+          outputSchema: { type: string }
+
+        fix:
+          task: copilot.invoke
+          inputs:
+            prompt: { $from: node, node: readFixPrompt }
+            model: { $from: input, name: model }
+            workingDirectory: { $from: input, name: root }
+            permissionMode: approveAll
+            expectJson: false
+            sessionIdleTimeoutSeconds: 3600
+
+        finalize:
+          task: pwsh.run
+          dependsOn: [fix]
+          inputs:
+            script: "& (Join-Path $args[0] 'examples/self-review/scripts/Invoke-Finalize.ps1') -RepoRoot $args[0] -RunDir $args[1] -BaselineFile $args[2] -Axis $args[3] -Title $args[4] -LogPath $args[5] -Index $args[6] -Total $args[7] -HasCandidate $args[8]"
+            args:
+              - { $from: input, name: root }
+              - { $from: input, name: runDir }
+              - { $from: input, name: baselineFile }
+              - { $from: node, node: pick, path: [result, axis] }
+              - { $from: node, node: pick, path: [result, title] }
+              - { $from: input, name: logPath }
+              - { $from: input, name: index }
+              - { $from: node, node: pick, path: [result, total] }
+              - { $from: node, node: pick, path: [result, hasCandidate] }
+            cwd: { $from: input, name: root }
+            timeoutSeconds: 1800
+            dryRunStdout: '{"accepted":false,"reason":"dry-run","shouldContinue":false}'
+          outputSchema: { type: object }
+      output:
+        shouldContinue: { $from: node, node: finalize, path: [result, shouldContinue] }
+        accepted: { $from: node, node: finalize, path: [result, accepted] }
+        state: {}

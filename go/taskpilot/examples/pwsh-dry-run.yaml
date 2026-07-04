@@ -1,0 +1,44 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+kind: taskpilot
+version: 1
+entry: showRepo
+tasks:
+  showRepo:
+    inputSchema:
+      type: object
+      required: [repo, depth]
+      properties:
+        repo:
+          type: string
+        depth:
+          type: integer
+    outputSchema:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: object
+    graph:
+      nodes:
+        run:
+          task: pwsh.run
+          inputs:
+            script: "[ordered]@{ repo = $args[0]; depth = [int]$args[1] } | ConvertTo-Json -Compress"
+            args:
+              - { $from: input, name: repo }
+              - { $from: input, name: depth }
+            dryRunStdout: '{"repo":"dry-run","depth":0}'
+          outputSchema:
+            type: object
+            required: [result, stdout, stderr, exitCode]
+            properties:
+              result: { type: object }
+              stdout: { type: string }
+              stderr: { type: string }
+              exitCode: { type: integer }
+      output:
+        result:
+          $from: node
+          node: run

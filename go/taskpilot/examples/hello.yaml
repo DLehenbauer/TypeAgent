@@ -1,0 +1,36 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+kind: taskpilot
+version: 1
+entry: hello
+tasks:
+  hello:
+    inputSchema:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+    outputSchema:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+    graph:
+      nodes:
+        render:
+          task: template.expand
+          inputs:
+            template: "Hello, {{ name }}!"
+            vars:
+              name:
+                $from: input
+                name: name
+          outputSchema:
+            type: string
+      output:
+        message:
+          $from: node
+          node: render

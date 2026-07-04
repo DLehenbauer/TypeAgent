@@ -1,0 +1,4 @@
+# Transient / regenerated files go here
+.tmp/*
+# Keep the directory so tooling that writes into it (tasks, coverage) works
+!.tmp/.gitkeep
