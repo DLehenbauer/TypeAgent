@@ -10,12 +10,70 @@ TaskPilot builds and verifies the graph before execution, runs independent nodes
 
 ## Quick start
 
-Build the binary (outputs `tp.exe` in the current directory), or install it onto your PATH:
+### 1. Check out the source
+
+TaskPilot lives under the `go/` subtree of the [DLehenbauer/TypeAgent](https://github.com/DLehenbauer/TypeAgent/tree/taskpilot) fork.
+
+Clone the `taskpilot` branch and change into the TaskPilot directory:
 
 ```powershell
-go build -o tp.exe ./cmd/tp   # build into repo root
+git clone --branch taskpilot https://github.com/DLehenbauer/TypeAgent.git
+cd TypeAgent/go/taskpilot
+```
+
+Alternatively, use a sparse, shallow checkout to fetch just the `go/` subtree:
+
+```powershell
+git clone --filter=blob:none --no-checkout --depth 1 --branch taskpilot https://github.com/DLehenbauer/TypeAgent.git
+cd TypeAgent
+git sparse-checkout init --cone
+git sparse-checkout set go
+git checkout taskpilot
+cd go/taskpilot
+```
+
+### 2. Install the Go toolchain
+
+TaskPilot requires Go 1.22 or later.
+
+```powershell
+# Windows
+winget install --id GoLang.Go -e
+```
+
+```bash
+# macOS (Homebrew)
+brew install go
+
+# Linux (Debian/Ubuntu)
+sudo apt-get update && sudo apt-get install -y golang-go
+```
+
+Verify the toolchain is on your PATH:
+
+```powershell
+go version
+```
+
+### 3. Install TaskPilot
+
+Install the `tp` binary onto your PATH (`go install` compiles and installs in one step):
+
+```powershell
 go install ./cmd/tp           # install into $(go env GOPATH)\bin
 ```
+
+Make sure `$(go env GOPATH)\bin` (Windows) or `$(go env GOPATH)/bin` (macOS/Linux) is on your PATH so the installed `tp` binary is available.
+
+### 4. Verify the installation
+
+Confirm `tp` is on your PATH and prints its version:
+
+```powershell
+tp version
+```
+
+### 5. Run a workflow
 
 ```powershell
 tp verify examples\hello.yaml
