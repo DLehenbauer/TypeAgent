@@ -22,7 +22,8 @@ entry: selfReview
 # parallel safely; only the ratchet loop mutates the tree, and it is serial.
 #
 # Every input has a default, so the workflow runs with no flags; an empty
-# --root falls back to the git toplevel of the working directory:
+# --root walks up from the working directory to the nearest go.mod (the
+# taskpilot module root):
 #
 #   tp verify examples/self-review/self-review.yaml
 #   tp run examples/self-review/self-review.yaml
@@ -128,7 +129,7 @@ tasks:
       type: object
       required: [root, pattern, reviewModel, guardModel, fixModel, maxCandidates]
       properties:
-        # root defaults to "" and is resolved to the git toplevel by resolveRoot.
+        # root defaults to "" and is resolved to the go.mod module root by resolveRoot.
         root: { type: string, default: "" }
         pattern: { type: string, default: "{cmd,internal}/**/*.go" }
         reviewModel: { type: string, default: "auto" }
@@ -145,20 +146,25 @@ tasks:
         ratchet: {}
     graph:
       nodes:
-        # Resolve the repo root once: use --root when given, else fall back to
-        # the git toplevel of the working directory (the default). Runs in the
-        # process CWD (no cwd) so git can locate the repo before the root is
+        # Resolve the repo root once: use --root when given, else walk up from
+        # the working directory to the nearest go.mod (the taskpilot module
+        # root, where examples/ and the review scripts live). Anchoring on
+        # go.mod -- not `git rev-parse --show-toplevel` -- keeps this correct
+        # when taskpilot is checked out nested inside another git repository,
+        # where the git toplevel would resolve above the module root and the
+        # relative script paths would miss. Runs in the process CWD (no cwd) so
+        # the walk starts from the invocation directory before the root is
         # known; every downstream node reads {result, root} from here.
         #
         # Threads runId (as an unused $args[1]) purely to opt out of caching:
-        # the resolved root depends on ambient state (the invocation's CWD / git
-        # toplevel) that the cache key cannot capture, so without this a stale
-        # entry -- e.g. a root from a previous location of this repo -- would be
-        # replayed on a cache hit instead of re-resolving.
+        # the resolved root depends on ambient state (the invocation's CWD) that
+        # the cache key cannot capture, so without this a stale entry -- e.g. a
+        # root from a previous location of this repo -- would be replayed on a
+        # cache hit instead of re-resolving.
         resolveRoot:
           task: pwsh.run
           inputs:
-            script: "$r = $args[0]; if ([string]::IsNullOrWhiteSpace($r)) { $r = (& git rev-parse --show-toplevel 2>$null); if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($r)) { throw 'root not provided and current directory is not a git repository' } }; [pscustomobject]@{ root = $r.Trim() } | ConvertTo-Json -Compress"
+            script: "$r = $args[0]; if ([string]::IsNullOrWhiteSpace($r)) { $d = (Get-Location).Path; while ($d -and -not (Test-Path (Join-Path $d 'go.mod'))) { $p = Split-Path $d -Parent; if ($p -eq $d) { $d = $null; break }; $d = $p }; if (-not $d) { throw 'root not provided and no go.mod found at or above the working directory' }; $r = $d }; [pscustomobject]@{ root = $r.Trim() } | ConvertTo-Json -Compress"
             args:
               - { $from: input, name: root }
               - { $from: run, name: id }
