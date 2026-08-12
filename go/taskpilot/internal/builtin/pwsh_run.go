@@ -10,6 +10,8 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/provider"
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/retry"
+	"github.com/microsoft/TypeAgent/go/taskpilot/internal/script"
+	"github.com/microsoft/TypeAgent/go/taskpilot/internal/target"
 )
 
 // PwshRunInput configures a pwsh.run: the script and its args run under the
@@ -34,7 +36,19 @@ type PwshRunInput struct {
 	RetryOnTimeout bool `json:"retryOnTimeout,omitempty"`
 	// AllowNonZeroExit treats any non-zero exit as a successful (cacheable)
 	// result the workflow can branch on, instead of a node failure.
-	AllowNonZeroExit      bool `json:"allowNonZeroExit,omitempty"`
+	AllowNonZeroExit bool `json:"allowNonZeroExit,omitempty"`
+	// RunsOn optionally binds a lease, running the script inside that execution
+	// context instead of on the host. Host execution is simply the absence of a
+	// lease, so an unbound RunsOn preserves today's behaviour exactly. The name
+	// matches GitHub Actions' runs-on and the engine's own dependsOn; `on` was
+	// avoided because it means triggers in Actions.
+	RunsOn any `json:"runsOn,omitempty"`
+	// Cache controls host-side memoization. It defaults to true when omitted.
+	// Lease-bound runs are always executed regardless of this value.
+	Cache bool `json:"cache,omitempty"`
+	// Checkpoint asks a target-bound run to commit the successful result as the
+	// next lease state. It is invalid without RunsOn.
+	Checkpoint            bool `json:"checkpoint,omitempty"`
 	MaxAttempts           int  `json:"maxAttempts,omitempty"`
 	InitialBackoffSeconds int  `json:"initialBackoffSeconds,omitempty"`
 	MaxBackoffSeconds     int  `json:"maxBackoffSeconds,omitempty"`
@@ -42,28 +56,97 @@ type PwshRunInput struct {
 
 type pwshTask struct{}
 
+// pwshRunTaskName is the registered name of the pwsh.run builtin. It is a
+// constant so the external-state policy table can reference it without an
+// initialization cycle through Spec().
+const pwshRunTaskName = "pwsh.run"
+
+// PwshRunsOnInput is the input key binding a lease to a pwsh.run node.
+const PwshRunsOnInput = "runsOn"
+
 func (t *pwshTask) Spec() model.TaskSpec {
 	return model.TaskSpec{
-		Name:        "pwsh.run",
+		Name:        pwshRunTaskName,
 		Version:     "1",
 		InputSchema: structToSchema(reflect.TypeOf(PwshRunInput{})),
+		LeaseInputs: []string{PwshRunsOnInput},
+		EmitsLease:  true,
 	}
 }
 
 func (t *pwshTask) Execute(ctx context.Context, input map[string]any, taskCtx Context) (any, error) {
+	lease, onLease, err := optionalLeaseInput(input, PwshRunsOnInput, pwshRunTaskName)
+	if err != nil {
+		return nil, err
+	}
+	if !onLease && boolValue(input["checkpoint"]) {
+		return nil, fmt.Errorf("%s: checkpoint requires %s", pwshRunTaskName, PwshRunsOnInput)
+	}
 	if taskCtx.DryRun {
 		stdout := asString(input["dryRunStdout"])
-		result, err := provider.ParsePwshStdout(stdout)
+		result, err := script.ParseStdout(stdout)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{provider.PwshOutputResult: result, provider.PwshOutputStdout: stdout, provider.PwshOutputStderr: "", provider.PwshOutputExitCode: 0, "planned": true}, nil
+		out := map[string]any{provider.PwshOutputResult: result, provider.PwshOutputStdout: stdout, provider.PwshOutputStderr: "", provider.PwshOutputExitCode: 0, "planned": true}
+		if onLease {
+			out[LeaseOutput] = model.LeaseRef(lease)
+		}
+		return out, nil
 	}
-	p, ok := taskCtx.Providers.Get(provider.NamePwsh)
+	if onLease {
+		return t.executeOnLease(ctx, lease, input, taskCtx)
+	}
+	if taskCtx.Services == nil || taskCtx.Services.Providers == nil {
+		return nil, fmt.Errorf("pwsh provider not configured")
+	}
+	p, ok := taskCtx.Services.Providers.Get(provider.NamePwsh)
 	if !ok {
 		return nil, fmt.Errorf("pwsh provider not configured")
 	}
 	return p.Submit(ctx, provider.Request{Input: input}).Await(ctx)
+}
+
+// executeOnLease runs the script inside the leased execution context and emits
+// the successor lease.
+//
+// Only a checkpointing run advances the lease's state. A transient run threads
+// the lease through unchanged.
+func (t *pwshTask) executeOnLease(ctx context.Context, lease model.Lease, input map[string]any, taskCtx Context) (any, error) {
+	if taskCtx.Services == nil || taskCtx.Services.Targets == nil {
+		return nil, fmt.Errorf("%s: execution targets are not configured", pwshRunTaskName)
+	}
+	backend, err := taskCtx.Services.Targets.Require(target.Kind(lease.Kind))
+	if err != nil {
+		return nil, err
+	}
+	checkpoint := boolValue(input["checkpoint"])
+	request, err := script.Decode(input, model.FileRefPath)
+	if err != nil {
+		return nil, err
+	}
+	req := target.RunRequest{ID: lease.ID, State: lease.State, Script: request}
+	if checkpoint {
+		// The node's own content-addressed identity is the durable name of the
+		// state this run establishes, so the provider can key its store by it and
+		// recognize the same state on a later run.
+		req.Checkpoint = taskCtx.NodeID
+	}
+	outcome, err := backend.Run(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	out := outcome.Result.Map()
+	successor := lease
+	// Advance only on a confirmed commit. A body can fail without the call
+	// failing (a non-zero exit is an ordinary result, and allowNonZeroExit makes
+	// it a success), and naming a state the provider never snapshotted would
+	// fail unrecoverably at the next restore.
+	if checkpoint && outcome.Committed {
+		successor = lease.WithState(taskCtx.NodeID)
+	}
+	out[LeaseOutput] = model.LeaseRef(successor)
+	return out, nil
 }
 
 // Retry classifies each run by its result. A malformed provider result (not the

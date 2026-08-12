@@ -245,11 +245,16 @@ func (s *Store) Claim(nodeID, runID string) (Claim, error) {
 	}
 }
 
-// GC removes staging and inflight files whose modification time is older than
-// maxAge. It returns the number of removed entries and the first error
+// Sweep removes staging and inflight files whose modification time is older
+// than maxAge. It returns the number of removed entries and the first error
 // encountered while reading a directory; individual removal failures are
 // ignored.
-func (s *Store) GC(maxAge time.Duration) (int, error) {
+//
+// This reclaims by age rather than by reachability, which is why it is not
+// called GC: nothing here traces which entries are still referenced. It is the
+// store's half of what `tp cache gc` does, alongside target.Registry.SweepAll
+// for external target state.
+func (s *Store) Sweep(maxAge time.Duration) (int, error) {
 	removed := 0
 	for _, dir := range []string{s.stagingRoot(), s.inflightRoot()} {
 		entries, err := os.ReadDir(dir)
@@ -303,7 +308,8 @@ func releaseClaim(path string, claim claimInfo) error {
 	var current claimInfo
 	if err := json.Unmarshal(raw, &current); err != nil {
 		// The claim file is corrupt or was rewritten by another runner; it is not
-		// verifiably ours, so leave it in place for stale-claim GC to reclaim.
+		// verifiably ours, so leave it in place for the stale-claim sweep to
+		// reclaim.
 		return nil
 	}
 	if current != claim {

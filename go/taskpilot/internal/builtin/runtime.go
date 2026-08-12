@@ -8,6 +8,7 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/provider"
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/retry"
+	"github.com/microsoft/TypeAgent/go/taskpilot/internal/target"
 )
 
 type schemaRegistry struct {
@@ -70,13 +71,16 @@ func specs() []model.TaskSpec {
 type Runtime struct {
 	executors map[string]Executor
 	tasks     map[string]Task
-	providers *provider.Set
+	services  *Services
 }
 
 type Context struct {
-	RunID     string
-	DryRun    bool
-	Providers *provider.Set
+	RunID string
+	// NodeID is the content-addressed identity of the executing node. A
+	// checkpointing target run uses it as the durable state name.
+	NodeID   string
+	DryRun   bool
+	Services *Services
 }
 
 type Executor func(context.Context, map[string]any, Context) (any, error)
@@ -138,14 +142,31 @@ func (r *Runtime) reserve(name string) {
 	}
 }
 
-// SetProviders injects the provider set made available to tasks during execution.
-func (r *Runtime) SetProviders(p *provider.Set) { r.providers = p }
+// SetServices injects the runtime integrations made available to tasks.
+func (r *Runtime) SetServices(s *Services) { r.services = s }
+
+// SetProviders is a test convenience for workflows that use no targets.
+func (r *Runtime) SetProviders(p *provider.Set) {
+	if r.services == nil {
+		r.services = &Services{}
+	}
+	r.services.Providers = p
+}
+
+// SetTargets is a test convenience for workflows that use no ordinary
+// providers.
+func (r *Runtime) SetTargets(targets *target.Registry) {
+	if r.services == nil {
+		r.services = &Services{}
+	}
+	r.services.Targets = targets
+}
 
 // externalDigesters maps each content-addressed builtin to the function that
-// digests the external filesystem state its output depends on. Tasks absent from
-// this map have no external state and are cached on their inputs alone.
+// digests the external filesystem state its output depends on.
 var externalDigesters = map[string]func(map[string]any) (string, error){
 	fileReadJSONSpec.Name:      fileContentDigest,
+	fileWriteSpec.Name:         fileWriteDigest,
 	fileExistsSpec.Name:        fileExistsDigest,
 	fileGlobSpec().Name:        globDigest,
 	fileRefSpec.Name:           fileContentDigest,
@@ -154,24 +175,67 @@ var externalDigesters = map[string]func(map[string]any) (string, error){
 	templateExpandSpec.Name:    templatePathDigest,
 }
 
-// ExternalDigest returns a digest of the external state task depends on and
-// ok=true when task is content-addressed; otherwise it returns ok=false. The
-// digest folds into the node identity so the node re-runs when that state
-// changes and cache-hits when it does not.
-func (r *Runtime) ExternalDigest(task string, input map[string]any) (string, bool, error) {
+// CacheBehavior reports whether a node may be memoized and the optional digest
+// of external state that participates in identity.
+func (r *Runtime) CacheBehavior(task string, input map[string]any) (memoize bool, digest string, err error) {
+	if spec, ok := r.taskSpec(task); ok && spec.AlwaysRun {
+		return false, "", nil
+	}
+	if task == pwshRunTaskName {
+		if _, bound := input[PwshRunsOnInput]; bound {
+			return false, "", nil
+		}
+		if raw, present := input["cache"]; present {
+			cache, ok := raw.(bool)
+			if !ok {
+				return false, "", fmt.Errorf("%s: cache must be a boolean", task)
+			}
+			if !cache {
+				return false, "", nil
+			}
+		}
+	}
 	digester, ok := externalDigesters[task]
 	if !ok {
-		return "", false, nil
+		return true, "", nil
 	}
-	digest, err := digester(input)
+	digest, err = digester(input)
 	if err != nil {
-		return "", false, err
+		return false, "", err
 	}
-	return digest, true, nil
+	return true, digest, nil
+}
+
+// IdentityInputs removes operational task inputs that must not invalidate
+// content-addressed target state.
+func (r *Runtime) IdentityInputs(task string, input map[string]any) map[string]any {
+	projected := model.ProjectLeaseIdentityMap(input)
+	if task == LeaseAcquireTaskName {
+		delete(projected, LeaseKeepOnFailureInput)
+		if options, ok := projected[LeaseOptionsInput].(map[string]any); ok {
+			// Connection credentials and workspace mappings affect how a target
+			// is reached, not the durable machine/checkpoint state it represents.
+			delete(options, "guest")
+			delete(options, "workspace")
+		}
+	}
+	return projected
+}
+
+func (r *Runtime) taskSpec(name string) (model.TaskSpec, bool) {
+	if task, ok := r.tasks[name]; ok {
+		return task.Spec(), true
+	}
+	for _, spec := range specs() {
+		if spec.Name == name {
+			return spec, true
+		}
+	}
+	return model.TaskSpec{}, false
 }
 
 func (r *Runtime) Execute(ctx context.Context, name string, input map[string]any, taskCtx Context) (any, error) {
-	taskCtx.Providers = r.providers
+	taskCtx.Services = r.services
 	if t, ok := r.tasks[name]; ok {
 		opts, err := t.Retry(input)
 		if err != nil {

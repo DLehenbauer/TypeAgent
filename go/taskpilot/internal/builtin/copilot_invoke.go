@@ -57,7 +57,10 @@ func (t *copilotTask) Execute(ctx context.Context, input map[string]any, taskCtx
 		}
 		return map[string]any{"planned": true, "prompt": input["prompt"], "context": input["context"], "retry": policy}, nil
 	}
-	p, ok := taskCtx.Providers.Get(provider.NameCopilot)
+	if taskCtx.Services == nil || taskCtx.Services.Providers == nil {
+		return nil, fmt.Errorf("copilot provider not configured")
+	}
+	p, ok := taskCtx.Services.Providers.Get(provider.NameCopilot)
 	if !ok {
 		return nil, fmt.Errorf("copilot provider not configured")
 	}

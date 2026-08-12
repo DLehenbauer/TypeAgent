@@ -80,7 +80,7 @@ var commands = []command{
 		name: "run",
 		usage: func() string {
 			var parallel strings.Builder
-			for _, name := range provider.Names() {
+			for _, name := range integrationNames() {
 				fmt.Fprintf(&parallel, " [--%s-parallel N]", name)
 			}
 			return fmt.Sprintf("  tp run <root-task-file> [--input file.json|-.] [--dry-run] [--quiet] [--max-parallel N]%s [--otlp-endpoint host:port] [--key value...]", parallel.String())
@@ -150,7 +150,7 @@ type runOptions struct {
 func parseRunArgs(args []string) (runOptions, error) {
 	opts := runOptions{
 		maxParallel: defaultMaxParallel,
-		limits:      provider.DefaultLimits(),
+		limits:      defaultLimits(),
 		dynamic:     map[string]string{},
 		jsonValues:  map[string]any{},
 	}
@@ -345,16 +345,14 @@ func runWorkflow(args []string, stdout, stderr io.Writer) error {
 	}
 
 	rt := builtin.RuntimeRegistry()
-	providers := provider.Default(opts.limits)
-	// Providers may own process-level resources (the Copilot provider shares a
-	// single CLI server across invocations); release them once the run ends.
-	defer providers.Close()
-	rt.SetProviders(providers)
+	services := composeRuntime(opts.limits)
+	defer services.Close()
+	rt.SetServices(services)
 	runner := engine.New(res.Doc, rt, store, tp)
 
 	// Translate Ctrl-C / SIGTERM into context cancellation so an interrupted run
 	// unwinds through the normal return path. That lets the deferred
-	// providers.Close (and each task's deferred session cleanup) release the
+	// services.Close (and each task's deferred session cleanup) releases the
 	// shared CLI server and its sessions instead of orphaning the process.
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -653,17 +651,31 @@ func cacheCommand(args []string, stdout io.Writer) error {
 	if len(args) != 1 || args[0] != "gc" {
 		return errors.New("usage: tp cache gc")
 	}
+
 	state, err := cache.ResolveStateDir()
 	if err != nil {
 		return err
 	}
+
 	store := cache.New(cache.CacheDir(state))
-	removed, err := store.GC(cache.DefaultClaimMaxAge)
+	removed, err := store.Sweep(cache.DefaultClaimMaxAge)
 	if err != nil {
 		return err
 	}
+
 	fmt.Fprintf(stdout, "removed %d stale cache item(s)\n", removed)
-	return nil
+
+	// Providers that own external state (VM checkpoints, container layers) sweep
+	// their own stores: the engine decides when to collect, each backend decides
+	// what its state is and how to discard it. That keeps checkpoint eviction out
+	// of the engine and off any reachability analysis of its own.
+	services := composeRuntime(defaultLimits())
+	defer services.Close()
+	swept, sweepErr := services.Targets.SweepAll(context.Background(), cache.DefaultClaimMaxAge)
+	if swept > 0 || sweepErr != nil {
+		fmt.Fprintf(stdout, "removed %d external state item(s)\n", swept)
+	}
+	return sweepErr
 }
 
 // pathsCommand prints the locations tp resolves at runtime so external

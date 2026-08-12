@@ -178,6 +178,7 @@ func validateGraph(r *collector, doc *model.Document, reg model.Registry, taskNa
 	if len(cycle) > 0 {
 		r.err("tasks.%s.graph: cycle detected: %s", taskName, strings.Join(cycle, " -> "))
 	}
+	validateLeases(r, reg, doc, taskName, g)
 	info.Order = order
 	for to, froms := range deps {
 		for from := range froms {

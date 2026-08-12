@@ -3,20 +3,18 @@ package provider
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"time"
-)
 
-const defaultPwshTimeoutSeconds = 300
+	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
+	"github.com/microsoft/TypeAgent/go/taskpilot/internal/script"
+)
 
 // StderrTailCap bounds how many trailing bytes of stderr are surfaced in error
 // diagnostics; scripts emit the operative error last, so the tail is kept.
-const StderrTailCap = 1000
+const StderrTailCap = script.StderrTailCap
 
 // Pwsh I/O contract keys name the request input fields and result envelope
 // fields exchanged between the pwsh provider and the pwsh.run builtin task.
@@ -24,16 +22,16 @@ const StderrTailCap = 1000
 // literals also appear as json struct tags on builtin.PwshRunInput, so any
 // rename must update both sides together to keep the contract in sync.
 const (
-	PwshInputScript         = "script"
-	PwshInputArgs           = "args"
-	PwshInputCwd            = "cwd"
-	PwshInputTimeoutSeconds = "timeoutSeconds"
+	PwshInputScript         = script.InputScript
+	PwshInputArgs           = script.InputArgs
+	PwshInputCwd            = script.InputCwd
+	PwshInputTimeoutSeconds = script.InputTimeoutSeconds
 
-	PwshOutputResult   = "result"
-	PwshOutputStdout   = "stdout"
-	PwshOutputStderr   = "stderr"
-	PwshOutputExitCode = "exitCode"
-	PwshOutputTimedOut = "timedOut"
+	PwshOutputResult   = script.OutputResult
+	PwshOutputStdout   = script.OutputStdout
+	PwshOutputStderr   = script.OutputStderr
+	PwshOutputExitCode = script.OutputExitCode
+	PwshOutputTimedOut = script.OutputTimedOut
 )
 
 // commandRunner abstracts process execution. Production always uses the
@@ -92,83 +90,13 @@ func (p *PwshProvider) Submit(ctx context.Context, req Request) Future {
 	})
 }
 
-// pwshRequest is the validated, typed form of a pwsh provider Request.Input.
-// Decoding into it rejects malformed fields at the provider boundary instead of
-// silently coercing them: a non-string script or cwd, a scalar (rather than an
-// array) args value, or a timeoutSeconds that is not a positive integer are
-// errors here rather than being stringified, wrapped, or dropped in favor of
-// the default.
-type pwshRequest struct {
-	script         string
-	args           []string
-	cwd            string
-	timeoutSeconds int
-}
-
-// decodePwshRequest validates input against the pwsh I/O contract and builds a
-// typed pwshRequest, returning an error that names the first field whose value
-// has the wrong shape. Fields unrelated to the provider (e.g. the pwsh.run
-// retry/exit knobs) are ignored.
-func decodePwshRequest(input map[string]any) (pwshRequest, error) {
-	req := pwshRequest{timeoutSeconds: defaultPwshTimeoutSeconds}
-
-	script, err := pwshStringField(input, PwshInputScript, true)
-	if err != nil {
-		return pwshRequest{}, err
-	}
-	req.script = script
-
-	cwd, err := pwshStringField(input, PwshInputCwd, false)
-	if err != nil {
-		return pwshRequest{}, err
-	}
-	req.cwd = cwd
-
-	args, err := pwshArgs(input[PwshInputArgs])
-	if err != nil {
-		return pwshRequest{}, err
-	}
-	req.args = args
-
-	if v, present := input[PwshInputTimeoutSeconds]; present && v != nil {
-		n, ok := intValue(v)
-		if !ok || n <= 0 {
-			return pwshRequest{}, fmt.Errorf("pwsh: %s must be a positive integer, got %v", PwshInputTimeoutSeconds, v)
-		}
-		req.timeoutSeconds = n
-	}
-
-	return req, nil
-}
-
-// pwshStringField reads a string-typed contract field. A present value of any
-// other type is rejected rather than stringified; a required field that is
-// absent (or an empty string) is likewise an error.
-func pwshStringField(input map[string]any, key string, required bool) (string, error) {
-	v, present := input[key]
-	if !present || v == nil {
-		if required {
-			return "", fmt.Errorf("pwsh: %s is required", key)
-		}
-		return "", nil
-	}
-	s, ok := v.(string)
-	if !ok {
-		return "", fmt.Errorf("pwsh: %s must be a string, got %T", key, v)
-	}
-	if required && s == "" {
-		return "", fmt.Errorf("pwsh: %s is required", key)
-	}
-	return s, nil
-}
-
 func (p *PwshProvider) run(ctx context.Context, req Request) (Result, error) {
-	decoded, err := decodePwshRequest(req.Input)
+	decoded, err := script.Decode(req.Input, model.FileRefPath)
 	if err != nil {
 		return nil, err
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, time.Duration(decoded.timeoutSeconds)*time.Second)
+	runCtx, cancel := context.WithTimeout(ctx, time.Duration(decoded.TimeoutSeconds)*time.Second)
 	defer cancel()
 
 	scriptFile, err := os.CreateTemp("", "taskpilot-pwsh-*.ps1")
@@ -177,7 +105,7 @@ func (p *PwshProvider) run(ctx context.Context, req Request) (Result, error) {
 	}
 	scriptPath := scriptFile.Name()
 	defer os.Remove(scriptPath)
-	if _, err := scriptFile.WriteString(decoded.script); err != nil {
+	if _, err := scriptFile.WriteString(decoded.Script); err != nil {
 		scriptFile.Close()
 		return nil, err
 	}
@@ -185,54 +113,15 @@ func (p *PwshProvider) run(ctx context.Context, req Request) (Result, error) {
 		return nil, err
 	}
 
-	cmdArgs := append([]string{"-NoProfile", "-NonInteractive", "-File", scriptPath}, decoded.args...)
-	stdout, stderr, exitCode, err := p.runner.Run(runCtx, cmdArgs, decoded.cwd)
+	cmdArgs := append([]string{"-NoProfile", "-NonInteractive", "-File", scriptPath}, decoded.Args...)
+	stdout, stderr, exitCode, err := p.runner.Run(runCtx, cmdArgs, decoded.Cwd)
 	if err != nil {
 		return nil, err
 	}
-	result := map[string]any{PwshOutputStdout: stdout, PwshOutputStderr: stderr, PwshOutputExitCode: exitCode}
-	// Distinguish a deadline-kill from an ordinary non-zero exit: a killed
-	// process otherwise looks like a generic failure. Callers (the pwsh task)
-	// use this to decide whether a timeout is retryable.
-	if runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-		result[PwshOutputTimedOut] = true
+	timedOut := runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+	result, err := script.NewResult(stdout, stderr, exitCode, timedOut)
+	if err != nil {
+		return nil, err
 	}
-	if exitCode == 0 {
-		parsed, err := ParsePwshStdout(stdout)
-		if err != nil {
-			return nil, decorateStdoutError(err, stderr)
-		}
-		result[PwshOutputResult] = parsed
-	}
-	return result, nil
-}
-
-// decorateStdoutError appends a trimmed stderr snippet to a stdout-parse error.
-// A script can exit 0 yet emit a diagnostic on stderr (or nothing at all);
-// surfacing stderr turns an opaque "stdout is empty" into the script's own
-// message when it has one.
-func decorateStdoutError(err error, stderr string) error {
-	trimmed := strings.TrimSpace(stderr)
-	if trimmed == "" {
-		return err
-	}
-	if len(trimmed) > StderrTailCap {
-		trimmed = "..." + trimmed[len(trimmed)-StderrTailCap:]
-	}
-	return fmt.Errorf("%w; stderr: %s", err, trimmed)
-}
-
-// ParsePwshStdout parses the JSON value emitted by a successful pwsh script.
-// It is exported so dry-run planning can produce the same output envelope as a
-// real provider execution.
-func ParsePwshStdout(stdout string) (any, error) {
-	trimmed := strings.TrimSpace(stdout)
-	if trimmed == "" {
-		return nil, fmt.Errorf("pwsh stdout is empty: expected JSON")
-	}
-	var result any
-	if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
-		return nil, fmt.Errorf("parse pwsh stdout JSON: %w", err)
-	}
-	return result, nil
+	return result.Map(), nil
 }

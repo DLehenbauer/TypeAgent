@@ -599,23 +599,22 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 	if version == "" {
 		version = e.taskVersion(node.Task)
 	}
-	identityInputs := input
+	identityInputs := e.runtime.IdentityInputs(node.Task, input)
 	var externalDigest string
-	nonCacheable := e.dependsOnRunID(node.Task, map[string]bool{}) || templateUsesRunID(node.Inputs)
-	if nonCacheable {
-		identityInputs = map[string]any{"runId": opts.RunID}
-	} else if !opts.DryRun {
-		// Content-addressed builtins (file.read, file.glob, ...) fold a digest of
-		// the external filesystem state into their identity so they re-run when
-		// that state changes and cache-hit when it does not. Skipped in dry-run,
-		// which does not consult the cache.
-		if digest, ok, derr := e.runtime.ExternalDigest(node.Task, input); derr != nil {
-			fail("external_digest", derr)
+	memoize := true
+	if !opts.DryRun {
+		var derr error
+		memoize, externalDigest, derr = e.runtime.CacheBehavior(node.Task, input)
+		if derr != nil {
+			fail("cache_behavior", derr)
 			return nodeResult{}, derr
-		} else if ok {
-			externalDigest = digest
 		}
 	}
+	runIDScoped := e.dependsOnRunID(node.Task, map[string]bool{}) || templateUsesRunID(node.Inputs)
+	if runIDScoped {
+		identityInputs = map[string]any{"runId": opts.RunID}
+	}
+	memoize = memoize && !runIDScoped
 	nodeID, err := plan.NodeID(plan.NodeIdentity{Task: node.Task, Version: version, Inputs: identityInputs, External: externalDigest, Predecessors: predecessors})
 	if err != nil {
 		fail("node_identity", err)
@@ -625,10 +624,10 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 		attribute.String(telemetry.AttrNodeID, nodeID),
 		attribute.String(telemetry.AttrVersion, version),
 	)
-	if !nonCacheable {
+	if memoize {
 		span.SetAttributes(attribute.String(telemetry.AttrCachePath, e.cache.EntryRef(nodeID).Path))
 	}
-	if !opts.DryRun && !nonCacheable {
+	if !opts.DryRun && memoize {
 		if cached, ok, err := e.cache.Read(nodeID); err != nil {
 			fail("cache_read", err)
 			return nodeResult{}, err
@@ -644,7 +643,7 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 			return nodeResult{NodeID: nodeID, Output: decoded}, nil
 		}
 	}
-	if !opts.DryRun && !nonCacheable {
+	if !opts.DryRun && memoize {
 		claim, cached, err := e.claimOrWaitForCache(ctx, span, id, nodeID, opts.RunID)
 		if err != nil {
 			return nodeResult{}, err
@@ -673,7 +672,7 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 	if _, ok := e.doc.Tasks[node.Task]; ok {
 		output, err = e.runTask(ctx, node.Task, input, opts)
 	} else {
-		output, err = e.runtime.Execute(ctx, node.Task, input, builtin.Context{RunID: opts.RunID, DryRun: opts.DryRun})
+		output, err = e.runtime.Execute(ctx, node.Task, input, builtin.Context{RunID: opts.RunID, NodeID: nodeID, DryRun: opts.DryRun})
 	}
 	if err != nil {
 		fail("execution", err)
@@ -692,7 +691,7 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 		return nodeResult{NodeID: nodeID, Output: output}, nil
 	}
 
-	if nonCacheable {
+	if !memoize {
 		span.SetAttributes(attribute.String(telemetry.AttrCacheStatus, telemetry.CacheStatusNonCacheable))
 		span.SetStatus(codes.Ok, "")
 		return nodeResult{NodeID: nodeID, Output: output}, nil

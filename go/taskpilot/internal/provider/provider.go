@@ -202,8 +202,8 @@ type providerSpec struct {
 // default cap is computed at call time rather than frozen at package init.
 func catalog() []providerSpec {
 	return []providerSpec{
-		{NamePwsh, DefaultPwshParallel, func(limit int) Provider { return NewPwshProvider(limit) }},
-		{NameCopilot, DefaultCopilotParallel(), func(limit int) Provider { return NewCopilotProvider(nil, limit) }},
+		{name: NamePwsh, defaultLimit: DefaultPwshParallel, build: func(limit int) Provider { return NewPwshProvider(limit) }},
+		{name: NameCopilot, defaultLimit: DefaultCopilotParallel(), build: func(limit int) Provider { return NewCopilotProvider(nil, limit) }},
 	}
 }
 
@@ -217,25 +217,14 @@ func DefaultLimits() Limits {
 	return limits
 }
 
-// Names returns the built-in provider names in catalog order. It lets callers
-// (e.g. CLI flag wiring and help text) enumerate the roster deterministically
-// without mirroring the provider list.
-func Names() []Name {
-	specs := catalog()
-	names := make([]Name, len(specs))
-	for i, spec := range specs {
-		names[i] = spec.name
-	}
-	return names
-}
-
 // Default wires the real providers backed by live system integrations, applying
 // the given concurrency limits. A provider absent from limits runs unbounded.
 func Default(limits Limits) *Set {
-	specs := catalog()
-	providers := make([]Provider, len(specs))
-	for i, spec := range specs {
-		providers[i] = spec.build(limits[spec.name])
+	providers := make([]Provider, 0)
+	for _, spec := range catalog() {
+		if spec.build != nil {
+			providers = append(providers, spec.build(limits[spec.name]))
+		}
 	}
 	return NewSet(providers...)
 }

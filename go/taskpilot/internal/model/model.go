@@ -153,12 +153,28 @@ func (l *LoopSpec) RefTemplates() []TemplateField {
 	}
 }
 
+// LeaseOutputKey is the output name under which a task emits a lease. It is the
+// single spelling shared by the builtins that emit leases and by verification,
+// which uses it to tell a reference that carries a lease from one that merely
+// reads the same node's ordinary result.
+const LeaseOutputKey = "lease"
+
 // TaskSpec is a registry's view of a callable task: its Name, Version, and the
-// InputSchema callers must satisfy.
+// InputSchema callers must satisfy, plus how it participates in a lease chain.
 type TaskSpec struct {
 	Name        string
 	Version     string
 	InputSchema any
+	// LeaseInputs names the input properties that carry a lease. A node that
+	// binds one of them to another node's output consumes that lease.
+	LeaseInputs []string
+	// EmitsLease reports whether the task produces a lease. A task with no
+	// LeaseInputs is an acquisition root; a task with a bound LeaseInput threads
+	// the consumed lease to its successor.
+	EmitsLease bool
+	// AlwaysRun disables engine memoization because serving the task from cache
+	// would skip a required process-local side effect.
+	AlwaysRun bool
 }
 
 // Registry resolves task names to their specs, exposing single lookups via Get

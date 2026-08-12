@@ -50,32 +50,6 @@ func TestBuildPromptWithoutFileRefsHasNoFilesSection(t *testing.T) {
 	}
 }
 
-func TestPwshArgsCollapseFileRefsToPaths(t *testing.T) {
-	args, err := pwshArgs([]any{
-		"literal",
-		model.FileRef("/repo/data.txt", "cafef00d"),
-		42,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"literal", "/repo/data.txt", "42"}
-	if len(args) != len(want) {
-		t.Fatalf("args = %v, want %v", args, want)
-	}
-	for i := range want {
-		if args[i] != want[i] {
-			t.Fatalf("arg %d = %q, want %q", i, args[i], want[i])
-		}
-	}
-}
-
-func TestPwshArgsRejectsNonArray(t *testing.T) {
-	if _, err := pwshArgs("D:\\tvm"); err == nil {
-		t.Fatal("expected error for scalar args, got nil")
-	}
-}
-
 func TestReplaceFileRefsWalksNestedStructures(t *testing.T) {
 	v := map[string]any{
 		"list": []any{

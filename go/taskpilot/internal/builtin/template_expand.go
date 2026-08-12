@@ -41,11 +41,9 @@ func expandTemplate(_ context.Context, input map[string]any, _ Context) (any, er
 		if !ok || v == nil {
 			return ""
 		}
-		// A resolved fileref var collapses to its on-disk path -- matching how
-		// the Copilot and pwsh consumers render references -- so the var expands
-		// to the path the prompt tells the agent to read, not the raw envelope.
-		if p, ok := model.FileRefPath(v); ok {
-			return p
+		// A resolved file reference collapses to the path the consumer reads.
+		if path, ok := model.FileRefPath(v); ok {
+			return path
 		}
 		return fmt.Sprint(v)
 	}), nil

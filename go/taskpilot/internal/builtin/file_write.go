@@ -39,3 +39,10 @@ func writeFile(_ context.Context, input map[string]any, ctx Context) (any, error
 	}
 	return in.Path, nil
 }
+
+func fileWriteDigest(input map[string]any) (string, error) {
+	if asString(input["path"]) == "" {
+		return "", fmt.Errorf("file.write: path must not be empty")
+	}
+	return fileContentDigest(input)
+}

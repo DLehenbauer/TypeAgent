@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,30 @@ func TestBaseTaskRetryIsNoRetry(t *testing.T) {
 	}
 	if opts.OnError != nil || opts.OnResult != nil || opts.Policy.MaxAttempts != 0 {
 		t.Fatalf("BaseTask.Retry = %#v, want zero retry.Options", opts)
+	}
+}
+
+func TestPwshRunRejectsMalformedRunsOn(t *testing.T) {
+	_, err := (&pwshTask{}).Execute(context.Background(), map[string]any{
+		PwshRunsOnInput: map[string]any{"lease": "not a lease envelope"},
+		"dryRunStdout":  "{}",
+	}, Context{DryRun: true})
+	if err == nil {
+		t.Fatal("expected malformed runsOn error")
+	}
+	if msg := err.Error(); !strings.Contains(msg, PwshRunsOnInput) || !strings.Contains(msg, "path: [lease]") {
+		t.Fatalf("error = %q, want input name and path hint", msg)
+	}
+}
+
+func TestPwshRunRejectsCheckpointWithoutTarget(t *testing.T) {
+	_, err := (&pwshTask{}).Execute(context.Background(), map[string]any{
+		"script":       "Write-Output '{}'",
+		"checkpoint":   true,
+		"dryRunStdout": "{}",
+	}, Context{DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "checkpoint requires") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

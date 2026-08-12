@@ -210,7 +210,7 @@ func TestParseRunArgsProviderParallelFlags(t *testing.T) {
 		if opts.maxParallel != defaultMaxParallel {
 			t.Fatalf("maxParallel = %d, want %d", opts.maxParallel, defaultMaxParallel)
 		}
-		want := provider.DefaultLimits()
+		want := defaultLimits()
 		if !maps.Equal(opts.limits, want) {
 			t.Fatalf("limits = %v, want %v", opts.limits, want)
 		}

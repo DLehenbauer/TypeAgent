@@ -101,3 +101,70 @@ Provider caps are configured per run:
 
 - `--copilot-parallel N` — max concurrent Copilot invocations (scales to available memory).
 - `--pwsh-parallel N` — max concurrent PowerShell executions (default 8).
+- `--hyperv-parallel N` — max concurrent Hyper-V target operations on Windows (default 1).
+
+## Cache control
+
+A host `pwsh.run` is memoized by default. Set `cache: false` when its purpose is a side effect that must be performed on every run:
+
+```yaml
+- task: pwsh.run
+  inputs:
+    script: ./scripts/New-HostShare.ps1
+    cache: false
+```
+
+Filesystem-observing builtins such as `file.glob` remain memoized: a digest of the observed state participates in node identity. Lease lifecycle and lease-bound runs always execute because their process-local effects cannot be replayed from the engine cache.
+
+## Execution targets and leases
+
+Host execution is the absence of a lease. Bind one with `runsOn` and the same body runs on a durable target instead:
+
+```yaml
+- task: lease.acquire
+  inputs:
+    kind: hyperv
+    options:
+      baseImage: C:\images\windows.vhdx
+      guest:
+        username: Administrator
+        passwordEnv: HYPERV_GUEST_PASSWORD
+        winRMPort: 5985
+        readinessTimeoutSeconds: 300
+        connectionTimeoutSeconds: 5                      # -> a $lease
+
+- task: pwsh.run
+  inputs:
+    runsOn: { $from: node, node: vm, path: [lease] }
+    script: ./scripts/Apply-Config.ps1
+    checkpoint: true                                      # advances the lease's state
+
+- task: lease.release
+  inputs: { lease: { $from: node, node: tests, path: [lease] } }
+```
+
+A lease is **linear**: `tp verify` rejects a graph in which a lease has zero or two-plus consumers, or whose chain does not end in `lease.release`. That is what makes exclusive access and total ordering of mutations fall out of dataflow rather than runtime locking — and it turns a forgotten teardown into a verification error rather than a leaked machine. Pass `keep: true` to `lease.release` to leave the context up for inspection.
+
+Every lease-bound run bypasses engine memoization. A run with `checkpoint: true` commits its content-addressed node ID as the successor lease state; a plain `runsOn` run is transient and threads the current state through unchanged.
+
+Adding a target kind (SSH, container, cloud VM) implements the small target backend contract and registers it at the CLI composition root. `tp cache gc` uses the same composition, so every runnable target is also swept.
+
+Hyper-V is a compile-time extension under `extensions/windows/hyperv`; its
+PowerShell driver and host/guest helpers are embedded and materialized as one
+private bundle per action. Guest and optional workspace passwords are resolved
+from caller-named environment variables and are never workflow options.
+Operational `guest` and `workspace` settings do not affect checkpoint identity.
+Runtime plugins are intentionally deferred. Go's standard plugin mechanism does
+not support Windows; a future runtime extension should use a versioned
+subprocess protocol.
+
+## Data-plane references
+
+Two explicit reference envelopes flow through task inputs and outputs:
+
+| Envelope | Carries | Identity |
+|---|---|---|
+| `$file` | path + content fingerprint | whole envelope |
+| `$lease` | kind, physical id, logical state | `{kind, state}` — the physical allocation is excluded |
+
+File references render to their paths when passed to PowerShell, templates, or Copilot. Lease references may only be bound to declared lease inputs.

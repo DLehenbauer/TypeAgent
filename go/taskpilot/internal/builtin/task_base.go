@@ -29,5 +29,7 @@ func taskObjects() []Task {
 	return []Task{
 		&copilotTask{},
 		&pwshTask{},
+		&leaseAcquireTask{},
+		&leaseReleaseTask{},
 	}
 }
