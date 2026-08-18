@@ -33,6 +33,8 @@ var sourceFingerprintSpec = model.TaskSpec{
 	InputSchema: structToSchema(reflect.TypeOf(FingerprintInput{})),
 }
 
+// fingerprintSource returns the source.fingerprint output object for path.
+// Dry runs return the expected shape without reading the source tree.
 func fingerprintSource(_ context.Context, input map[string]any, ctx Context) (any, error) {
 	path := asString(input["path"])
 	if ctx.DryRun {
@@ -48,10 +50,8 @@ func fingerprintSource(_ context.Context, input map[string]any, ctx Context) (an
 	return toGenericJSON(FingerprintOutput{Path: path, Fingerprint: fp})
 }
 
-// fingerprint hashes the source at path. The digester registered for
-// source.fingerprint reuses this same function so the cache identity and the
-// observable Fingerprint output derive from a single traversal, keeping their
-// semantics (file vs. recursive directory) from drifting apart.
+// fingerprint hashes a file or directory recursively.
+// Runtime cache digesting uses the same helper so identity matches task output.
 func fingerprint(path string) (string, error) {
 	h := sha256.New()
 	hashFile := func(path, name string) error {
@@ -75,6 +75,8 @@ func fingerprint(path string) (string, error) {
 		return hex.EncodeToString(h.Sum(nil)), nil
 	}
 	var files []string
+	// Walk the tree once and sort the file list so equivalent directories produce
+	// the same digest regardless of filesystem traversal order.
 	if err := filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err

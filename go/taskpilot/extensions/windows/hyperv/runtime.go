@@ -11,10 +11,12 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+// gate limits Hyper-V work behind an optional semaphore.
 type gate struct {
 	sem *semaphore.Weighted
 }
 
+// newGate creates an optional concurrency gate.
 func newGate(limit int) *gate {
 	if limit <= 0 {
 		return &gate{}
@@ -22,6 +24,7 @@ func newGate(limit int) *gate {
 	return &gate{sem: semaphore.NewWeighted(int64(limit))}
 }
 
+// run invokes fn under the optional concurrency gate.
 func (g *gate) run(ctx context.Context, fn func(context.Context) (any, error)) (any, error) {
 	if g.sem != nil {
 		if err := g.sem.Acquire(ctx, 1); err != nil {
@@ -32,10 +35,12 @@ func (g *gate) run(ctx context.Context, fn func(context.Context) (any, error)) (
 	return fn(ctx)
 }
 
+// commandRunner executes PowerShell commands through a common interface.
 type commandRunner interface {
 	Run(ctx context.Context, args []string, dir string) (stdout string, stderr string, exitCode int, err error)
 }
 
+// execRunner runs PowerShell commands with a shared output contract.
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, args []string, dir string) (string, string, int, error) {
@@ -57,6 +62,7 @@ func (execRunner) Run(ctx context.Context, args []string, dir string) (string, s
 	return stdout.String(), stderr.String(), 0, nil
 }
 
+// intValue coerces integer-like values from decoded option maps.
 func intValue(v any) (int, bool) {
 	switch n := v.(type) {
 	case int:

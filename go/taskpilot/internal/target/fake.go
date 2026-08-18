@@ -42,8 +42,10 @@ type FakeBackend struct {
 	sweeps    int
 }
 
+// Kind reports the fake backend kind.
 func (f *FakeBackend) Kind() Kind { return FakeKind }
 
+// Acquire returns a synthetic instance for a fresh lease.
 func (f *FakeBackend) Acquire(context.Context, AcquireRequest) (Instance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -55,6 +57,7 @@ func (f *FakeBackend) Acquire(context.Context, AcquireRequest) (Instance, error)
 	return Instance{ID: "fake-instance", BaselineState: state, MaterializedState: state}, nil
 }
 
+// Release records whether the caller kept or tore down the instance.
 func (f *FakeBackend) Release(_ context.Context, id string, keep bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -66,6 +69,7 @@ func (f *FakeBackend) Release(_ context.Context, id string, keep bool) error {
 	return nil
 }
 
+// Run records a script execution and commits non-empty checkpoints unless RefuseCommit is set.
 func (f *FakeBackend) Run(_ context.Context, req RunRequest) (RunOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -87,6 +91,7 @@ func (f *FakeBackend) Run(_ context.Context, req RunRequest) (RunOutcome, error)
 	return RunOutcome{Result: out, Committed: committed}, nil
 }
 
+// Sweep records a cleanup pass.
 func (f *FakeBackend) Sweep(context.Context, time.Duration) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -26,10 +26,10 @@ const (
 	FormatJSON
 )
 
-// FormatForPath returns the workflow Format implied by path's filename
+// FormatForPath returns the workflow format implied by path's filename
 // extension. The recognized extensions are .yaml and .yml (YAML) and .json
-// (JSON); any other extension yields FormatUnknown. This is the single source
-// of workflow extension resolution, shared by parsing and CLI autodetection.
+// (JSON); any other extension yields FormatUnknown. LoadFile and CLI
+// autodetection share this extension resolution.
 func FormatForPath(path string) Format {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".yaml", ".yml":

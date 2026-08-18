@@ -84,8 +84,8 @@ func DecodeSpanRecord(line []byte) (telemetry.SpanRecord, error) {
 }
 
 // ReadSpanRecords reads every span record from r, decoding one record per line
-// via DecodeSpanRecord and skipping blank lines. It stops at the first
-// malformed line.
+// via DecodeSpanRecord and skipping blank lines. It stops at the first malformed
+// line.
 func ReadSpanRecords(r io.Reader) ([]telemetry.SpanRecord, error) {
 	scanner := NewScanner(r)
 	var records []telemetry.SpanRecord
@@ -129,6 +129,7 @@ func (p *Processor) OnEnd(s sdktrace.ReadOnlySpan) {
 	p.write(telemetry.EndRecord(s))
 }
 
+// write validates the processor lifecycle and serializes rec under p.mu.
 func (p *Processor) write(rec telemetry.SpanRecord) {
 	if p == nil {
 		panic("logging: write on nil Processor")
@@ -139,6 +140,7 @@ func (p *Processor) write(rec telemetry.SpanRecord) {
 	if p.closed {
 		panic("logging: write on closed Processor")
 	}
+	// Preserve the first encoding failure so the next flush or shutdown surfaces it.
 	if err := p.enc.Encode(rec); err != nil && p.writeErr == nil {
 		p.writeErr = fmt.Errorf("encode %s record: %w", rec.Phase, err)
 	}

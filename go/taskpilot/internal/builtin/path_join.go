@@ -8,8 +8,8 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 )
 
-// PathJoinInput is the input for the path.join task. Parts is required and
-// holds the path segments joined in order via filepath.Join.
+// PathJoinInput is the input for the path.join task. Parts contains the path
+// segments joined in order via filepath.Join.
 type PathJoinInput struct {
 	Parts []string `json:"parts"`
 }

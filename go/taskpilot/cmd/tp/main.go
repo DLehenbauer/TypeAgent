@@ -32,6 +32,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
+// main runs the CLI entrypoint and exits with status 1 after printing errors.
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "tp:", err)
@@ -39,6 +40,7 @@ func main() {
 	}
 }
 
+// run dispatches top-level commands, including help, version, and file-path shorthand.
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		printHelp(stdout)
@@ -64,13 +66,13 @@ func run(args []string, stdout, stderr io.Writer) error {
 	return fmt.Errorf("unknown command %q", cmd)
 }
 
-// command is a single top-level subcommand. The commands table is the sole
+// command defines a single top-level subcommand. The commands table is the sole
 // source of truth for both dispatch (run) and help output (printHelp), so
 // adding or renaming a command is a one-line edit.
 type command struct {
 	name string
-	// usage returns the help line(s) for this command. It is a function so
-	// dynamic usage (e.g. per-provider --NAME-parallel flags) can be computed.
+	// usage builds the help line(s) for this command. It is a function so
+	// dynamic usage (for example, per-integration --NAME-parallel flags) can be computed.
 	usage func() string
 	run   func(args []string, stdout, stderr io.Writer) error
 }
@@ -120,9 +122,9 @@ var commands = []command{
 }
 
 // defaultMaxParallel is a generous engine-wide safety ceiling on how many graph
-// nodes run at once. Per-provider concurrency caps are the real throttle for
-// side-effecting work, so this is sized to let cheap pure builtins fan out
-// freely rather than to gate providers.
+// nodes run at once. Per-provider and target-backend concurrency caps are the
+// real throttle for side-effecting work, so this is sized to let cheap pure
+// builtins fan out freely rather than to gate integrations.
 const defaultMaxParallel = 64
 
 func printHelp(w io.Writer) {
@@ -135,6 +137,7 @@ Usage:
 	}
 }
 
+// runOptions holds the parsed options for a tp run invocation.
 type runOptions struct {
 	file         string
 	inputFile    string
@@ -228,10 +231,9 @@ func parseRunArgs(args []string) (runOptions, error) {
 	return opts, nil
 }
 
-// providerParallelFlag reports whether arg is the per-provider concurrency flag
-// (--<name>-parallel) for a provider in the current roster, returning that
-// provider's name. The roster is the sole source of valid provider names, so
-// the CLI never mirrors the built-in provider list.
+// providerParallelFlag reports whether arg is a roster-backed concurrency flag
+// (--<name>-parallel), returning that limit name. The roster is the sole source
+// of valid names, so the CLI never mirrors built-in provider or target lists.
 func providerParallelFlag(arg string, roster provider.Limits) (provider.Name, bool) {
 	trimmed, ok := strings.CutPrefix(arg, "--")
 	if !ok {
@@ -248,6 +250,7 @@ func providerParallelFlag(arg string, roster provider.Limits) (provider.Name, bo
 	return name, true
 }
 
+// loadVerified loads a task document and validates it against built-in schemas.
 func loadVerified(file string) (*verify.VerifiedDocument, error) {
 	doc, err := parser.LoadFile(file)
 	if err != nil {
@@ -283,6 +286,7 @@ func (l runLocations) writePaths(w io.Writer, includeOutput bool) {
 	}
 }
 
+// runWorkflow executes a workflow and writes the final output and summary.
 func runWorkflow(args []string, stdout, stderr io.Writer) error {
 	opts, err := parseRunArgs(args)
 	if err != nil {
@@ -387,11 +391,10 @@ func runWorkflow(args []string, stdout, stderr io.Writer) error {
 		stats := runner.Stats()
 		if err != nil {
 			fmt.Fprintf(stderr, "tp run %s FAILED in %s\n", runID, elapsed.Round(time.Millisecond))
-			// Surface the root cause prominently. The error returned by Run is the
-			// message propagated up through every parent span; the trace log pins it
-			// to the node, task, and stage where it actually originated -- the same
-			// source of truth (and earliest-end-error ordering) that `tp log`
-			// and the debug skill use.
+			// Surface a likely root cause prominently. The error returned by Run is
+			// propagated up through parent spans; the trace log can usually pin it
+			// to a node, task, and stage using the same earliest-ending failed-node
+			// heuristic that `tp log` and the debug skill use.
 			if rec, ok := rootCauseFromLog(logPath); ok {
 				fmt.Fprintf(stderr, "  root cause: node %q (%s) failed at stage %s\n",
 					attrStr(rec, telemetry.AttrNodeName), attrStr(rec, telemetry.AttrTask), attrStr(rec, telemetry.AttrStage))
@@ -479,6 +482,7 @@ func otlpProcessor(ctx context.Context, endpoint string) (sdktrace.SpanProcessor
 	return sdktrace.NewBatchSpanProcessor(exp), label, nil
 }
 
+// rootInput builds the workflow input from files, flags, defaults, and schema validation.
 func rootInput(res *verify.VerifiedDocument, opts runOptions) (map[string]any, error) {
 	input := map[string]any{}
 	if opts.inputFile != "" {
@@ -508,6 +512,7 @@ func rootInput(res *verify.VerifiedDocument, opts runOptions) (map[string]any, e
 	return input, nil
 }
 
+// coerceFlag converts a CLI flag value using the declared root-input schema type when present.
 func coerceFlag(rootSchema any, key string, raw string) (any, error) {
 	var t string
 	if s, ok := rootSchema.(map[string]any); ok {
@@ -541,6 +546,7 @@ func coerceFlag(rootSchema any, key string, raw string) (any, error) {
 	}
 }
 
+// readInput reads stdin for "-" or a named file otherwise.
 func readInput(path string) ([]byte, error) {
 	if path == "-" {
 		return io.ReadAll(os.Stdin)
@@ -548,9 +554,7 @@ func readInput(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-// verifyOptions holds the arguments for `tp verify`, which only needs the root
-// task file. Keeping this parser separate from parseRunArgs means run-only
-// flags never leak into verify and verify-only flags stay local to this parser.
+// verifyOptions holds the parsed arguments for the verify subcommand.
 type verifyOptions struct {
 	file string
 }
@@ -567,6 +571,7 @@ func parseVerifyArgs(args []string) (verifyOptions, error) {
 	return opts, nil
 }
 
+// verifyWorkflow verifies a task document and prints a task summary.
 func verifyWorkflow(args []string, stdout io.Writer) error {
 	opts, err := parseVerifyArgs(args)
 	if err != nil {
@@ -580,9 +585,7 @@ func verifyWorkflow(args []string, stdout io.Writer) error {
 	return nil
 }
 
-// graphOptions holds the arguments for `tp graph`: the root task file and the
-// output format. Kept separate from parseRunArgs so graph-only flags such as
-// --format live only alongside the graph command.
+// graphOptions holds the arguments for tp graph: the root task file and output format.
 type graphOptions struct {
 	file   string
 	format string
@@ -609,6 +612,7 @@ func parseGraphArgs(args []string) (graphOptions, error) {
 	return opts, nil
 }
 
+// graphWorkflow renders a verified task graph as DOT or JSON.
 func graphWorkflow(args []string, stdout io.Writer) error {
 	opts, err := parseGraphArgs(args)
 	if err != nil {
@@ -647,6 +651,7 @@ func builtinCommand(args []string, stdout io.Writer) error {
 	return nil
 }
 
+// cacheCommand sweeps stale staging/inflight state and external target state.
 func cacheCommand(args []string, stdout io.Writer) error {
 	if len(args) != 1 || args[0] != "gc" {
 		return errors.New("usage: tp cache gc")
@@ -665,10 +670,10 @@ func cacheCommand(args []string, stdout io.Writer) error {
 
 	fmt.Fprintf(stdout, "removed %d stale cache item(s)\n", removed)
 
-	// Providers that own external state (VM checkpoints, container layers) sweep
-	// their own stores: the engine decides when to collect, each backend decides
-	// what its state is and how to discard it. That keeps checkpoint eviction out
-	// of the engine and off any reachability analysis of its own.
+	// Target backends that own external state (VM checkpoints, container layers)
+	// sweep their own stores: the engine decides when to collect, each backend
+	// decides what its state is and how to discard it. That keeps checkpoint
+	// eviction out of the engine and off any reachability analysis of its own.
 	services := composeRuntime(defaultLimits())
 	defer services.Close()
 	swept, sweepErr := services.Targets.SweepAll(context.Background(), cache.DefaultClaimMaxAge)
@@ -678,8 +683,8 @@ func cacheCommand(args []string, stdout io.Writer) error {
 	return sweepErr
 }
 
-// pathsCommand prints the locations tp resolves at runtime so external
-// tooling (e.g. the debug-taskpilot-run skill) can consume them instead of
+// pathsCommand prints the locations tp resolves at runtime so external tooling
+// (for example, the debug-taskpilot-run skill) can consume them instead of
 // re-deriving the state-dir fallback rules. Output is "<name>\t<dir>" lines,
 // keeping cache.ResolveStateDir the single source of truth.
 func pathsCommand(args []string, stdout io.Writer) error {
@@ -696,6 +701,7 @@ func pathsCommand(args []string, stdout io.Writer) error {
 	return nil
 }
 
+// logOptions holds the parsed options for the log subcommand.
 type logOptions struct {
 	runID string
 	json  bool
@@ -724,6 +730,7 @@ func parseLogArgs(args []string) (logOptions, error) {
 	return opts, nil
 }
 
+// logCommand prints or follows a persisted run log.
 func logCommand(args []string, stdout io.Writer) error {
 	opts, err := parseLogArgs(args)
 	if err != nil {
@@ -746,6 +753,7 @@ func logCommand(args []string, stdout io.Writer) error {
 	return streamLog(context.Background(), logPath, state, stdout, opts.json, false)
 }
 
+// startLogTail streams the active log until the supplied context is cancelled.
 func startLogTail(ctx context.Context, logPath, state string, w io.Writer) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
@@ -755,6 +763,7 @@ func startLogTail(ctx context.Context, logPath, state string, w io.Writer) <-cha
 	return done
 }
 
+// streamLog renders log records, optionally following the file until context cancellation.
 func streamLog(ctx context.Context, logPath, state string, w io.Writer, jsonMode, follow bool) error {
 	r := newLogRenderer(state, !jsonMode && colorEnabled(w))
 	var offset int64
@@ -776,6 +785,7 @@ func streamLog(ctx context.Context, logPath, state string, w io.Writer, jsonMode
 	}
 }
 
+// readLogFrom reads log records from offset and renders them to w.
 func readLogFrom(logPath string, offset int64, r *logRenderer, w io.Writer, jsonMode bool) (int64, error) {
 	f, err := os.Open(logPath)
 	if err != nil {
@@ -806,8 +816,8 @@ func readLogFrom(logPath string, offset int64, r *logRenderer, w io.Writer, json
 // colorEnabled reports whether ANSI styling should be used for w. Styling is
 // applied only when the destination is an interactive terminal (a character
 // device) and the user has not opted out via the conventional NO_COLOR
-// variable. Buffers, pipes, and files therefore receive the plain, script
-// friendly format unchanged.
+// variable. Buffers, pipes, and files therefore receive the plain,
+// script-friendly format unchanged.
 func colorEnabled(w io.Writer) bool {
 	if os.Getenv("NO_COLOR") != "" {
 		return false
@@ -823,12 +833,12 @@ func colorEnabled(w io.Writer) bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
-// palette holds ANSI SGR codes, all empty when color is disabled so wrap is a
-// no-op.
+// palette holds ANSI SGR codes.
 type palette struct {
 	reset, bold, dim, red, green, cyan string
 }
 
+// newPalette builds the ANSI palette used by the pretty log renderer.
 func newPalette() palette {
 	return palette{
 		reset: "\x1b[0m",
@@ -840,6 +850,7 @@ func newPalette() palette {
 	}
 }
 
+// wrap surrounds s with an ANSI code and reset sequence.
 func (p palette) wrap(code, s string) string {
 	if code == "" || s == "" {
 		return s
@@ -873,6 +884,7 @@ type logRenderer struct {
 	start time.Time      // first observed timestamp; baseline for relative stamps
 }
 
+// newLogRenderer builds a renderer for streaming log output.
 func newLogRenderer(state string, color bool) *logRenderer {
 	r := &logRenderer{state: state, color: color, depth: map[string]int{}}
 	if color {
@@ -881,6 +893,7 @@ func newLogRenderer(state string, color bool) *logRenderer {
 	return r
 }
 
+// print renders one encoded span record in either plain or pretty mode.
 func (r *logRenderer) print(w io.Writer, line string) error {
 	rec, err := tflog.DecodeSpanRecord([]byte(line))
 	if err != nil {
@@ -892,10 +905,10 @@ func (r *logRenderer) print(w io.Writer, line string) error {
 	return r.printPretty(w, rec)
 }
 
-// track returns the indent depth for rec and maintains the spanID->depth map.
-// A start record nests one level under its parent (depth 0 when the parent is
-// unknown, e.g. the root run); the matching end record reuses and releases that
-// depth.
+// track returns the indent depth for rec and maintains the spanID->depth map. A
+// start record nests one level under its parent (depth 0 when the parent is
+// unknown, for example the root run); the matching end record reuses and
+// releases that depth.
 func (r *logRenderer) track(rec telemetry.SpanRecord) int {
 	if rec.Phase == telemetry.PhaseStart {
 		d := 0
@@ -930,10 +943,12 @@ func (r *logRenderer) stamp(t time.Time) string {
 	return r.pal.wrap(r.pal.dim, fmt.Sprintf("+%6.3fs", d.Seconds()))
 }
 
+// blankStamp builds the padding used for continuation lines.
 func (r *logRenderer) blankStamp() string {
 	return strings.Repeat(" ", stampWidth)
 }
 
+// printPretty renders one span record in the pretty terminal format.
 func (r *logRenderer) printPretty(w io.Writer, rec telemetry.SpanRecord) error {
 	depth := r.track(rec)
 	indent := strings.Repeat("  ", depth)
@@ -969,6 +984,7 @@ type spanRenderer interface {
 	pretty(pc prettyCtx, rec telemetry.SpanRecord) error
 }
 
+// rendererFor selects the renderer for a span record.
 func rendererFor(rec telemetry.SpanRecord) spanRenderer {
 	switch spanKind(rec) {
 	case telemetry.SpanKindRun:
@@ -1146,6 +1162,7 @@ func (eventSpanRenderer) pretty(pc prettyCtx, rec telemetry.SpanRecord) error {
 	return nil
 }
 
+// prettyEvents writes span events as indented continuation lines.
 func (r *logRenderer) prettyEvents(cont func(string), rec telemetry.SpanRecord) {
 	p := r.pal
 	for _, ev := range rec.Events {
@@ -1153,6 +1170,7 @@ func (r *logRenderer) prettyEvents(cont func(string), rec telemetry.SpanRecord) 
 	}
 }
 
+// spanEnd returns the end time for a span record, defaulting to the start time.
 func spanEnd(rec telemetry.SpanRecord) time.Time {
 	if rec.EndTime != nil {
 		return *rec.EndTime
@@ -1182,15 +1200,12 @@ func cacheLabel(status string) string {
 	}
 }
 
-// rootCauseFromLog scans a completed run's JSONL trace and returns the node
-// span that is the true root cause of a failure: the earliest-ending node-kind
-// span with an error status. A node error propagates up through every parent
-// (its subgraph, any forEach, and the top-level run) and fans out across
-// sibling branches, so the authoritative root cause is the first node to
-// actually fail, ordered by the span end timestamps the log records -- the same
-// rule the debug skill applies. ok is false when no failing node span is
-// present (e.g. the run failed before any node ran), in which case the caller
-// should fall back to the propagated error.
+// rootCauseFromLog scans a completed run's JSONL trace and returns the best
+// root-cause candidate: the earliest-ending node-kind span with an error
+// status. This is a heuristic for finding the originating node before its error
+// propagates through parent spans. ok is false when no failing node span is
+// present (for example, the run failed before any node ran), in which case the
+// caller should fall back to the propagated error.
 func rootCauseFromLog(logPath string) (telemetry.SpanRecord, bool) {
 	f, err := os.Open(logPath)
 	if err != nil {
@@ -1240,6 +1255,7 @@ func printSpanEvents(w io.Writer, rec telemetry.SpanRecord) {
 	}
 }
 
+// outputPreview builds a short output preview for a cached node result.
 func outputPreview(state string, rec telemetry.SpanRecord) (string, bool) {
 	rel := attrStr(rec, telemetry.AttrCachePath)
 	if rel == "" {
@@ -1281,6 +1297,7 @@ func tsEnd(rec telemetry.SpanRecord) string {
 	return spanEnd(rec).UTC().Format(logTimeLayout)
 }
 
+// attrStr extracts a span attribute as a human-readable string when present.
 func attrStr(rec telemetry.SpanRecord, key string) string {
 	if rec.Attributes == nil {
 		return ""
@@ -1291,6 +1308,7 @@ func attrStr(rec telemetry.SpanRecord, key string) string {
 	return ""
 }
 
+// validRunID validates a run ID for CLI and log-path usage.
 func validRunID(runID string) bool {
 	if runID == "" {
 		return false
@@ -1304,6 +1322,8 @@ func validRunID(runID string) bool {
 	return filepath.Base(runID) == runID
 }
 
+// resolveStateRelative resolves a path relative to the state directory and
+// rejects escapes outside it.
 func resolveStateRelative(state, rel string) (string, error) {
 	if rel == "" || filepath.IsAbs(rel) {
 		return "", errors.New("path must be relative to state dir")

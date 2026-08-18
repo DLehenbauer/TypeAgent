@@ -8,6 +8,7 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/tmpl"
 )
 
+// lookup resolves a dotted path using the runtime template traversal rules.
 func lookup(value any, path []string) (any, bool) {
 	segs := make([]any, len(path))
 	for i, seg := range path {
@@ -17,6 +18,7 @@ func lookup(value any, path []string) (any, bool) {
 	return v, err == nil
 }
 
+// asString formats runtime values as strings; nil becomes "".
 func asString(v any) string {
 	if v == nil {
 		return ""
@@ -24,6 +26,7 @@ func asString(v any) string {
 	return fmt.Sprint(v)
 }
 
+// asSlice returns nil for nil, []any unchanged, and other values as a one-item slice.
 func asSlice(v any) []any {
 	if v == nil {
 		return nil
@@ -34,6 +37,7 @@ func asSlice(v any) []any {
 	return []any{v}
 }
 
+// intValue reports an int for supported inputs that can be represented exactly.
 func intValue(v any) (int, bool) {
 	switch n := v.(type) {
 	case int:
@@ -56,10 +60,7 @@ func intValue(v any) (int, bool) {
 	}
 }
 
-// numericValue reports the float64 value of v when it is a supported numeric
-// type. The bool result is false for any non-numeric value (including json.Number
-// strings that fail to parse), letting callers enforce numeric invariants instead
-// of silently coercing to zero.
+// numericValue reports the float64 value for supported numeric inputs.
 func numericValue(v any) (float64, bool) {
 	switch n := v.(type) {
 	case int:
@@ -79,15 +80,13 @@ func numericValue(v any) (float64, bool) {
 	}
 }
 
+// boolValue reports v when it is a bool; other values return false.
 func boolValue(v any) bool {
 	b, _ := v.(bool)
 	return b
 }
 
-// toGenericJSON marshals v and unmarshals it back into the generic JSON value
-// shape (map[string]any, []any, ...) that the engine validates and caches. It
-// lets builtins source their output shape from a typed struct while still
-// emitting the plain JSON values the runtime expects.
+// toGenericJSON converts structured values into generic JSON values.
 func toGenericJSON(v any) (any, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -100,11 +99,7 @@ func toGenericJSON(v any) (any, error) {
 	return generic, nil
 }
 
-// decodeInput coerces the generic map[string]any input the runtime hands each
-// builtin into the task's typed input struct. It round-trips through JSON so
-// numeric widening, field naming, and missing-field defaults follow a single
-// set of encoding/json rules; every builtin that needs typed input decodes
-// through here so that behavior cannot drift between tasks.
+// decodeInput decodes a builtin's generic input map into its typed struct.
 func decodeInput[T any](input map[string]any) (T, error) {
 	var in T
 	raw, err := json.Marshal(input)
@@ -117,9 +112,7 @@ func decodeInput[T any](input map[string]any) (T, error) {
 	return in, nil
 }
 
-// parseJSONString decodes JSON text into the generic JSON value shape
-// (map[string]any, []any, ...). It is the single decoding path shared by
-// json.parse and file.readJson so their behavior and errors stay in sync.
+// parseJSONString parses JSON text into the generic runtime value graph.
 func parseJSONString(text string) (any, error) {
 	var value any
 	if err := json.Unmarshal([]byte(text), &value); err != nil {
@@ -128,6 +121,7 @@ func parseJSONString(text string) (any, error) {
 	return value, nil
 }
 
+// intSet builds a set from list-like numeric input.
 func intSet(v any) map[int]bool {
 	out := map[int]bool{}
 	for _, item := range asSlice(v) {

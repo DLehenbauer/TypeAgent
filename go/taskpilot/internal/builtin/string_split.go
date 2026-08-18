@@ -8,9 +8,8 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 )
 
-// StringSplitInput configures the string.split task: Text is the source string
-// split on every occurrence of Delimiter, and KeepEmpty controls whether empty
-// substrings are retained (false drops them, the default).
+// StringSplitInput configures the string.split task. Text is split with
+// strings.Split using Delimiter, and KeepEmpty retains empty substrings when set.
 type StringSplitInput struct {
 	Text      string `json:"text"`
 	Delimiter string `json:"delimiter"`

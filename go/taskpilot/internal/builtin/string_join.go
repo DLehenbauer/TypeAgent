@@ -8,9 +8,9 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 )
 
-// StringJoinInput is the input contract for the string.join task. List holds
-// the ordered elements to concatenate and Delimiter is inserted between each
-// adjacent pair; both fields are required.
+// StringJoinInput describes the input contract for the string.join task.
+// List contains the ordered elements to concatenate, and Delimiter is inserted
+// between adjacent pairs.
 type StringJoinInput struct {
 	List      []string `json:"list"`
 	Delimiter string   `json:"delimiter"`

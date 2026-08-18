@@ -11,6 +11,9 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 )
 
+// TemplateExpandInput carries the inputs for the template.expand task.
+// TemplatePath reads template text from disk and must not be combined with
+// Template; Vars supplies placeholder values.
 type TemplateExpandInput struct {
 	Template     string         `json:"template,omitempty"`
 	TemplatePath string         `json:"templatePath,omitempty"`
@@ -25,6 +28,8 @@ var templateExpandSpec = model.TaskSpec{
 
 var tmplRE = regexp.MustCompile(`\{\{\s*(?:[A-Za-z0-9_.-]+)\s*\}\}`)
 
+// expandTemplate replaces placeholders with Vars values.
+// Missing values expand to "", and file references expand to their paths.
 func expandTemplate(_ context.Context, input map[string]any, _ Context) (any, error) {
 	in, err := decodeInput[TemplateExpandInput](input)
 	if err != nil {
@@ -41,7 +46,6 @@ func expandTemplate(_ context.Context, input map[string]any, _ Context) (any, er
 		if !ok || v == nil {
 			return ""
 		}
-		// A resolved file reference collapses to the path the consumer reads.
 		if path, ok := model.FileRefPath(v); ok {
 			return path
 		}
@@ -49,11 +53,8 @@ func expandTemplate(_ context.Context, input map[string]any, _ Context) (any, er
 	}), nil
 }
 
-// templateText resolves the template source: the inline Template, or the
-// contents of TemplatePath when set. TemplatePath is the sanctioned way to
-// materialize a prompt or rubric from disk -- reading the file and expanding it
-// in one content-addressed node -- so prompt text never has to travel through a
-// separate whole-file read. Supplying both is a configuration error.
+// templateText returns inline template text, or reads TemplatePath when set.
+// Supplying both Template and TemplatePath is invalid.
 func templateText(in TemplateExpandInput) (string, error) {
 	if in.TemplatePath == "" {
 		return in.Template, nil
@@ -68,11 +69,8 @@ func templateText(in TemplateExpandInput) (string, error) {
 	return string(b), nil
 }
 
-// templatePathDigest is the external-state digester for template.expand. When
-// the template is read from templatePath, the node's output depends on that
-// file's content, so its identity folds in a content hash and it re-runs when
-// the file changes. An inline template has no external state and yields a
-// stable empty digest.
+// templatePathDigest hashes TemplatePath content for cache identity.
+// Inline templates have no external-state digest.
 func templatePathDigest(input map[string]any) (string, error) {
 	path := asString(input["templatePath"])
 	if path == "" {

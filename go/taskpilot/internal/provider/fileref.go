@@ -2,8 +2,8 @@ package provider
 
 import "github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 
-// replaceFileRefs walks v, replacing every file-reference envelope with its
-// path and collecting paths in first-seen order (de-duplicated).
+// replaceFileRefs replaces each file-reference envelope with its path and
+// returns distinct referenced paths in traversal order.
 func replaceFileRefs(v any) (any, []string) {
 	var paths []string
 	seen := map[string]bool{}

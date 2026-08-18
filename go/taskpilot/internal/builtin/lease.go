@@ -40,8 +40,10 @@ const (
 	LeaseOutput = model.LeaseOutputKey
 )
 
+// leaseAcquireTask acquires a target lease and publishes it for downstream tasks.
 type leaseAcquireTask struct{ BaseTask }
 
+// Spec returns the lease.acquire metadata exposed by the builtin registry.
 func (t *leaseAcquireTask) Spec() model.TaskSpec {
 	return model.TaskSpec{
 		Name:       LeaseAcquireTaskName,
@@ -60,6 +62,7 @@ func (t *leaseAcquireTask) Spec() model.TaskSpec {
 	}
 }
 
+// Execute acquires a lease from the selected target backend.
 func (t *leaseAcquireTask) Execute(ctx context.Context, input map[string]any, taskCtx Context) (any, error) {
 	kind := target.Kind(asString(input[LeaseKindInput]))
 	if kind == "" {
@@ -88,8 +91,11 @@ func (t *leaseAcquireTask) Execute(ctx context.Context, input map[string]any, ta
 	return leaseResult(model.Lease{Kind: string(kind), ID: instance.ID, State: instance.BaselineState}), nil
 }
 
+// leaseReleaseTask releases a target lease, optionally keeping the target for
+// inspection.
 type leaseReleaseTask struct{ BaseTask }
 
+// Spec returns the lease.release metadata exposed by the builtin registry.
 func (t *leaseReleaseTask) Spec() model.TaskSpec {
 	return model.TaskSpec{
 		Name:        LeaseReleaseTaskName,
@@ -107,6 +113,7 @@ func (t *leaseReleaseTask) Spec() model.TaskSpec {
 	}
 }
 
+// Execute releases the terminal lease through its target backend.
 func (t *leaseReleaseTask) Execute(ctx context.Context, input map[string]any, taskCtx Context) (any, error) {
 	lease, ok := model.AsLease(input[LeaseInput])
 	if !ok {
@@ -129,16 +136,12 @@ func (t *leaseReleaseTask) Execute(ctx context.Context, input map[string]any, ta
 	return map[string]any{"released": !keep}, nil
 }
 
-// leaseResult wraps a lease as a task output under the conventional key, so
-// downstream nodes bind it the same way regardless of which task emitted it.
+// leaseResult wraps an acquired lease under LeaseOutput for downstream bindings.
 func leaseResult(l model.Lease) map[string]any {
 	return map[string]any{LeaseOutput: model.LeaseRef(l)}
 }
 
-// optionalLeaseInput distinguishes an absent lease binding (host execution)
-// from a present but malformed value. The latter is an authoring error: a
-// whole-node reference can resolve to an ordinary output map, and silently
-// treating that as "no lease" would run a lease-intended operation on the host.
+// optionalLeaseInput distinguishes host execution from a malformed lease binding.
 func optionalLeaseInput(input map[string]any, key, taskName string) (model.Lease, bool, error) {
 	raw, present := input[key]
 	if !present || raw == nil {

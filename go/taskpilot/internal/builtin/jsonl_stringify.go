@@ -10,8 +10,7 @@ import (
 )
 
 // JsonlStringifyInput is the input contract for the jsonl.stringify task.
-// Items is the required list of values to serialize; each item is JSON-encoded
-// onto its own line, producing JSONL output.
+// Items is the required list of values to serialize as one JSON document per line.
 type JsonlStringifyInput struct {
 	Items []any `json:"items"`
 }
@@ -22,6 +21,7 @@ var jsonlStringifySpec = model.TaskSpec{
 	InputSchema: structToSchema(reflect.TypeOf(JsonlStringifyInput{})),
 }
 
+// stringifyJSONL serializes input["items"] as one JSON document per line.
 func stringifyJSONL(_ context.Context, input map[string]any, _ Context) (any, error) {
 	var b strings.Builder
 	for _, item := range asSlice(input["items"]) {

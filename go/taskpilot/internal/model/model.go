@@ -2,15 +2,15 @@ package model
 
 import "github.com/microsoft/TypeAgent/go/taskpilot/internal/version"
 
-// EngineVersion returns the engine's compatibility version. It is the single
-// source of truth shared with the CLI/package version (internal/version/VERSION),
-// so requiresEngine gating and the release version never drift. It is a function
-// rather than a package-global var so it cannot be mutated by other packages.
+// EngineVersion returns the engine compatibility version. It shares the
+// internal/version source used by the CLI, so requiresEngine checks and version
+// reporting cannot drift. It is a function rather than a package-global var so
+// other packages cannot mutate it.
 func EngineVersion() string { return version.Version() }
 
 // DocumentKind and DocumentVersion are the canonical identity values every
-// taskpilot document must declare. Verifier expectations and tests reference
-// these rather than re-encoding the literals.
+// taskpilot document must declare. Verify and tests reference these rather than
+// re-encoding the literals.
 const (
 	DocumentKind    = "taskpilot"
 	DocumentVersion = 1
@@ -75,9 +75,8 @@ const (
 	NodeModeLoop    NodeMode = "loop"
 )
 
-// DeclaredModes lists the execution variants a node sets, so verification can
-// require exactly one. A bare task counts as the task variant; forEach is a
-// task fan-out and reports forEach; loop reports loop.
+// DeclaredModes lists the execution variants a node sets. A bare task counts
+// as the task variant, so callers can detect invalid mixed modes.
 func (n Node) DeclaredModes() []NodeMode {
 	var modes []NodeMode
 	if n.Loop != nil {
@@ -93,7 +92,8 @@ func (n Node) DeclaredModes() []NodeMode {
 }
 
 // Mode returns the node's execution variant, resolving loop before forEach
-// before a plain task. It assumes the node passed verification's one-of check.
+// before a plain task. Callers should reject mixed loop/forEach shapes before
+// relying on the result.
 func (n Node) Mode() NodeMode {
 	switch {
 	case n.Loop != nil:
@@ -113,8 +113,7 @@ type ForEachSpec struct {
 }
 
 // RefTemplates returns the ForEachSpec fields whose templates may reference
-// other graph nodes, so dependency, run-id, and verify walkers share a single
-// field list.
+// other graph nodes. Dependency and run-ID walkers share this field list.
 func (f *ForEachSpec) RefTemplates() []TemplateField {
 	return []TemplateField{
 		{Name: "items", Value: f.Items},
@@ -139,13 +138,9 @@ type TemplateField struct {
 	Value any
 }
 
-// RefTemplates returns the LoopSpec fields walked for `$from: node` references,
-// so dependency and run-id walkers share a single field list. Only Inputs and
-// MaxIterations are listed. State resolves against the parent scope, and
-// ContinueWhen against the loop-local scope (state/index/body) layered over the
-// parent scope; both still retain access to other nodes' outputs at runtime,
-// but their node references are omitted here and so are not treated as
-// scheduling dependencies.
+// RefTemplates returns the LoopSpec fields walked for `$from: node` references.
+// State and ContinueWhen are loop-local controls and are excluded from both
+// dependency and run-ID analyses.
 func (l *LoopSpec) RefTemplates() []TemplateField {
 	return []TemplateField{
 		{Name: "inputs", Value: l.Inputs},

@@ -11,9 +11,9 @@ import (
 	"time"
 )
 
-// Store is a filesystem-backed cache rooted at a single directory. It is safe
-// for concurrent use across processes; commits and claims rely on atomic
-// filesystem operations rather than in-process locks.
+// Store is a filesystem-backed cache rooted at a single directory. Commits and
+// claim acquisition rely on atomic filesystem operations rather than in-process
+// locks.
 type Store struct {
 	root string
 }
@@ -48,6 +48,7 @@ type EntryRef struct {
 	Path   string `json:"path"`
 }
 
+// claimInfo records the runner that owns an inflight claim and when it started.
 type claimInfo struct {
 	RunID     string `json:"runId"`
 	StartedAt string `json:"startedAt"`
@@ -66,10 +67,10 @@ type Claim struct {
 // Held reports whether this caller acquired the claim.
 func (c Claim) Held() bool { return c.held }
 
-// Release relinquishes the claim, removing the claim file only if it is still
-// owned by this claim's runID. It is a no-op when the claim was not held or has
-// already been reclaimed by another runner. It returns an error only on
-// unexpected I/O failures.
+// Release relinquishes the claim, checking the on-disk owner before removing
+// the claim file. It is a no-op when the claim was not held or has already been
+// reclaimed by another runner. It returns an error only on unexpected I/O
+// failures.
 func (c Claim) Release() error {
 	if !c.held {
 		return nil
@@ -206,8 +207,7 @@ func (s *Store) Commit(e Entry) error {
 
 // Claim attempts to acquire the inflight claim for nodeID on behalf of runID.
 // The returned Claim's Held reports whether the claim was acquired; on success
-// call Release to relinquish it, which removes the claim only if it is still
-// owned by this runID. If the claim is already held by a live runner the
+// call Release to relinquish it. If an unexpired claim already exists, the
 // returned Claim is not held (Held reports false). Stale claims older than
 // DefaultClaimMaxAge are reclaimed automatically. An error is returned only on
 // unexpected I/O failures.
@@ -280,6 +280,9 @@ func (s *Store) Sweep(maxAge time.Duration) (int, error) {
 	return removed, nil
 }
 
+// removeStaleClaim reports whether the claim can be retried. It removes path
+// when its modification time exceeds DefaultClaimMaxAge and treats a missing
+// path as already removed.
 func removeStaleClaim(path string) (bool, error) {
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -297,6 +300,7 @@ func removeStaleClaim(path string) (bool, error) {
 	return true, nil
 }
 
+// releaseClaim best-effort releases a claim that matches the recorded owner.
 func releaseClaim(path string, claim claimInfo) error {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {

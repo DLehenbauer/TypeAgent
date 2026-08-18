@@ -9,19 +9,9 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/provider"
 )
 
-// copilotInvokeInput is the validated input contract for the copilot.invoke
-// task. Prompt is required; all other fields are optional and fall back to
-// provider defaults when omitted. Context carries arbitrary data passed to the
-// model, and OutputSchema, when set, constrains the model's response shape.
-// Model, ReasoningEffort, and ContextTier select the model and its effort/tier.
-// WorkingDirectory and PermissionMode scope filesystem and permission behavior.
-// ExpectJson signals that the response must be JSON. SessionIdleTimeoutSeconds
-// bounds session idle time. MaxAttempts, InitialBackoffSeconds, and
-// MaxBackoffSeconds govern retry pacing, and MaxValidationAttempts caps
-// output-schema validation retries. Every integer knob is validated up front:
-// when present it must be a positive integer (and MaxBackoffSeconds must not
-// fall below the effective InitialBackoffSeconds), otherwise the task fails
-// rather than silently defaulting or clamping the illegal value.
+// copilotInvokeInput defines the JSON-schema shape for copilot.invoke. Prompt is
+// required; other fields are provider options for model/context, output
+// validation, execution scope, idle timeout, and retry tuning.
 type copilotInvokeInput struct {
 	Prompt                    string `json:"prompt"`
 	Context                   any    `json:"context,omitempty"`
@@ -39,8 +29,10 @@ type copilotInvokeInput struct {
 	MaxValidationAttempts     int    `json:"maxValidationAttempts,omitempty"`
 }
 
+// copilotTask adapts the Copilot provider to the builtin Task interface.
 type copilotTask struct{ BaseTask }
 
+// Spec returns the copilot.invoke metadata used for registration and validation.
 func (t *copilotTask) Spec() model.TaskSpec {
 	return model.TaskSpec{
 		Name:        "copilot.invoke",
@@ -49,6 +41,7 @@ func (t *copilotTask) Spec() model.TaskSpec {
 	}
 }
 
+// Execute submits a Copilot request, or returns a planned result during dry runs.
 func (t *copilotTask) Execute(ctx context.Context, input map[string]any, taskCtx Context) (any, error) {
 	if taskCtx.DryRun {
 		policy, err := provider.CopilotPolicy(input)

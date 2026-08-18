@@ -23,6 +23,7 @@ var listMapSpec = model.TaskSpec{
 	InputSchema: structToSchema(reflect.TypeOf(ListMapInput{})),
 }
 
+// mapList applies the template to each input item and returns values in input order.
 func mapList(_ context.Context, input map[string]any, _ Context) (any, error) {
 	list := asSlice(input["list"])
 	template := input["template"]
@@ -37,6 +38,7 @@ func mapList(_ context.Context, input map[string]any, _ Context) (any, error) {
 	return out, nil
 }
 
+// applyTemplateValue resolves item and index references recursively in maps and slices.
 func applyTemplateValue(template any, item any, index int) (any, error) {
 	switch t := template.(type) {
 	case map[string]any:

@@ -132,6 +132,8 @@ func (e *Engine) Run(ctx context.Context, opts Options) (any, error) {
 	return out, nil
 }
 
+// runTask applies input defaults, validates the task contract, runs the graph,
+// and validates the task output.
 func (e *Engine) runTask(ctx context.Context, taskName string, input map[string]any, opts Options) (any, error) {
 	task, ok := e.doc.Tasks[taskName]
 	if !ok {
@@ -151,6 +153,8 @@ func (e *Engine) runTask(ctx context.Context, taskName string, input map[string]
 	return out, nil
 }
 
+// runGraph evaluates a task graph in dependency waves, caps each ready wave
+// with MaxParallel, then resolves the graph output.
 func (e *Engine) runGraph(ctx context.Context, taskName string, graph *model.Graph, input map[string]any, opts Options) (any, error) {
 	if graph == nil {
 		return nil, fmt.Errorf("task %s has no graph", taskName)
@@ -175,6 +179,7 @@ func (e *Engine) runGraph(ctx context.Context, taskName string, graph *model.Gra
 		if len(ready) == 0 {
 			return nil, fmt.Errorf("graph %s has no ready nodes; verify should have rejected this", taskName)
 		}
+		// Start the ready wave while capping graph-level concurrency.
 		sem := make(chan struct{}, opts.MaxParallel)
 		var wg sync.WaitGroup
 		var mu sync.Mutex
@@ -206,6 +211,8 @@ func (e *Engine) runGraph(ctx context.Context, taskName string, graph *model.Gra
 	return resolveTemplate(graph.Output, scope)
 }
 
+// buildDeps combines declared dependencies with node references found in
+// templates.
 func buildDeps(graph *model.Graph) map[string][]string {
 	out := map[string][]string{}
 	for id, node := range graph.Nodes {
@@ -238,6 +245,7 @@ func buildDeps(graph *model.Graph) map[string][]string {
 	return out
 }
 
+// readyNodes returns unfinished nodes whose dependencies have all completed.
 func readyNodes(graph *model.Graph, deps map[string][]string, done map[string]bool) []string {
 	var ready []string
 	for id := range graph.Nodes {
@@ -269,10 +277,8 @@ func spanLabel(name, task string) string {
 	return name + " (" + task + ")"
 }
 
-// splitForEachID separates a forEach item id of the form "name[3]" into its base
-// node name ("name") and 0-based item index (3). A plain node id is returned
-// unchanged with ok=false. Keeping the index out of the span name holds span
-// cardinality low so all items of a fan-out aggregate under one name.
+// splitForEachID separates a forEach item ID such as "name[3]" into its base
+// node name and 0-based item index.
 func splitForEachID(id string) (base string, index int, ok bool) {
 	if !strings.HasSuffix(id, "]") {
 		return id, 0, false
@@ -288,6 +294,7 @@ func splitForEachID(id string) (base string, index int, ok bool) {
 	return id[:open], n, true
 }
 
+// runNode dispatches a node to the execution path for its verified mode.
 func (e *Engine) runNode(ctx context.Context, id string, node model.Node, deps []string, scope *scopeState, opts Options) (nodeResult, error) {
 	switch node.Mode() {
 	case model.NodeModeLoop:
@@ -299,24 +306,12 @@ func (e *Engine) runNode(ctx context.Context, id string, node model.Node, deps [
 	}
 }
 
-// concurrencySlotsKey carries the stack of bounded-concurrency slots that the
-// current execution path occupies. Each scheduler (runGraph, runForEachNode)
-// appends a slotHolder when it launches a child, outermost first.
+// concurrencySlotsKey stores the bounded-concurrency slots occupied by the
+// current execution path.
 type concurrencySlotsKey struct{}
 
-// slotHolder owns one token in a bounded-concurrency semaphore on behalf of a
-// scheduler child (a graph node goroutine or a forEach worker) and the entire
-// subtree it spawns. A node deep in that subtree that blocks waiting for a peer
-// to commit a shared cache entry parks the holder, which frees the token so a
-// worker that holds the awaited claim can be scheduled. Without this, a worker
-// sitting in wg.Wait keeps an ancestor slot occupied while a descendant polls
-// for a claim held by a worker that cannot be scheduled because the pool is
-// full -- a deadlock that also pegs the CPU as the waiters poll the filesystem.
-//
-// The token is shared by the whole subtree, so park/unpark are reference
-// counted: the first parker frees the token and the last unparker re-occupies
-// it. This lets several descendants park concurrently without each trying to
-// drain the single token.
+// slotHolder owns one semaphore token for a worker subtree. Park/unpark are
+// reference-counted so multiple blocked descendants can share that token safely.
 type slotHolder struct {
 	sem      chan struct{}
 	mu       sync.Mutex
@@ -324,9 +319,8 @@ type slotHolder struct {
 	tokenOut bool
 }
 
-// park frees this holder's token if it is the first active parker. It never
-// blocks: the token is present (the slot is occupied) until the first parker
-// removes it.
+// park frees this holder's token when the first descendant blocks on a cache
+// claim.
 func (h *slotHolder) park() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -337,10 +331,8 @@ func (h *slotHolder) park() {
 	}
 }
 
-// unpark re-occupies the token once the last active parker resumes. The send can
-// block until a slot frees; every path re-occupies outermost-first (the order
-// holders appear on the stack), giving a consistent global order that keeps this
-// deadlock-free.
+// unpark reoccupies this holder's token after the last blocked descendant
+// resumes.
 func (h *slotHolder) unpark() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -351,8 +343,7 @@ func (h *slotHolder) unpark() {
 	}
 }
 
-// release permanently returns the token when the owning goroutine finishes. A
-// goroutine always unparks before returning, so the token is occupied here.
+// release permanently returns the token when the owning goroutine exits.
 func (h *slotHolder) release() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -361,9 +352,7 @@ func (h *slotHolder) release() {
 	}
 }
 
-// withConcurrencySlot pushes holder onto the path's slot stack so descendants
-// that block on a cache claim can park every slot they hold, not just their
-// immediate one.
+// withConcurrencySlot appends holder to the current path's slot stack.
 func withConcurrencySlot(ctx context.Context, holder *slotHolder) context.Context {
 	prev, _ := ctx.Value(concurrencySlotsKey{}).([]*slotHolder)
 	next := make([]*slotHolder, len(prev)+1)
@@ -372,13 +361,14 @@ func withConcurrencySlot(ctx context.Context, holder *slotHolder) context.Contex
 	return context.WithValue(ctx, concurrencySlotsKey{}, next)
 }
 
-// heldConcurrencySlots returns the slot holders occupied along the current path,
-// outermost first.
+// heldConcurrencySlots returns the current path's slots, outermost first.
 func heldConcurrencySlots(ctx context.Context) []*slotHolder {
 	slots, _ := ctx.Value(concurrencySlotsKey{}).([]*slotHolder)
 	return slots
 }
 
+// runForEachNode resolves the item list, runs each item under the effective
+// fan-out limit, and returns an aggregate node ID and output.
 func (e *Engine) runForEachNode(ctx context.Context, id string, node model.Node, deps []string, scope *scopeState, opts Options) (out nodeResult, err error) {
 	ctx, span := e.tracer.Start(ctx, spanLabel(id, "forEach "+node.Task), trace.WithAttributes(
 		attribute.String(telemetry.AttrSpanKind, telemetry.SpanKindForEach),
@@ -428,6 +418,7 @@ func (e *Engine) runForEachNode(ctx context.Context, id string, node model.Node,
 
 	outputs := make([]any, len(items))
 	nodeIDs := make([]string, len(items))
+	// Each item runs in a worker while preserving the effective fan-out cap.
 	sem := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -468,6 +459,8 @@ func (e *Engine) runForEachNode(ctx context.Context, id string, node model.Node,
 	return nodeResult{NodeID: aggregateID, Output: outputs}, nil
 }
 
+// runLoopNode invokes the body task until continueWhen is false or
+// maxIterations is reached.
 func (e *Engine) runLoopNode(ctx context.Context, id string, node model.Node, deps []string, scope *scopeState, opts Options) (out nodeResult, err error) {
 	ctx, span := e.tracer.Start(ctx, spanLabel(id, "loop "+node.Loop.BodyTask), trace.WithAttributes(
 		attribute.String(telemetry.AttrSpanKind, telemetry.SpanKindLoop),
@@ -502,6 +495,8 @@ func (e *Engine) runLoopNode(ctx context.Context, id string, node model.Node, de
 	}
 	var lastOutput any = map[string]any{}
 	var lastNodeID string
+	// Each pass resolves inputs with the current state and index, then may update
+	// state from the body output.
 	for i := 0; i < maxIterations; i++ {
 		loopScope := scope.withState(state).withIndex(i)
 		inputValue, err := resolveTemplate(node.Loop.Inputs, loopScope)
@@ -558,6 +553,8 @@ func (e *Engine) runLoopNode(ctx context.Context, id string, node model.Node, de
 	return nodeResult{NodeID: lastNodeID, Output: lastOutput}, nil
 }
 
+// runSingleNode resolves and validates inputs, computes the node identity, and
+// either serves cache or executes the task.
 func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, deps []string, scope *scopeState, opts Options) (nodeResult, error) {
 	baseName, itemIndex, isItem := splitForEachID(id)
 	nodeAttrs := []attribute.KeyValue{
@@ -713,6 +710,8 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 	return nodeResult{NodeID: nodeID, Output: output}, nil
 }
 
+// claimOrWaitForCache acquires the cache claim, possibly reclaiming a stale
+// claim, or waits for another worker to commit the entry.
 func (e *Engine) claimOrWaitForCache(ctx context.Context, span trace.Span, nodeName, nodeID, runID string) (cache.Claim, *cache.Entry, error) {
 	// Slots this execution path occupies (graph + forEach levels). While we
 	// sleep-poll for a peer to commit this node we release all of them so blocked
@@ -782,10 +781,12 @@ func (e *Engine) claimOrWaitForCache(ctx context.Context, span trace.Span, nodeN
 	}
 }
 
+// durationMillis returns the elapsed wait time in milliseconds.
 func durationMillis(started time.Time) int64 {
 	return time.Since(started).Milliseconds()
 }
 
+// predecessorIDs returns completed predecessor IDs in dependency order.
 func predecessorIDs(deps []string, scope *scopeState) []string {
 	predecessors := make([]string, 0, len(deps))
 	for _, dep := range deps {
@@ -794,6 +795,7 @@ func predecessorIDs(deps []string, scope *scopeState) []string {
 	return predecessors
 }
 
+// inputSchemaFor returns the input schema for a document task or builtin task.
 func (e *Engine) inputSchemaFor(name string) any {
 	if task, ok := e.doc.Tasks[name]; ok {
 		return task.InputSchema
@@ -806,6 +808,8 @@ func (e *Engine) inputSchemaFor(name string) any {
 	return nil
 }
 
+// dependsOnRunID reports whether a task graph reads the run ID directly or
+// through a nested task.
 func (e *Engine) dependsOnRunID(name string, seen map[string]bool) bool {
 	if name == builtin.RunIDTaskName {
 		return true
@@ -843,6 +847,8 @@ func (e *Engine) dependsOnRunID(name string, seen map[string]bool) bool {
 	return templateUsesRunID(task.Graph.Output)
 }
 
+// intValue coerces common integer-like values used for concurrency and
+// iteration limits.
 func intValue(v any) (int, bool) {
 	switch n := v.(type) {
 	case int:
@@ -859,10 +865,12 @@ func intValue(v any) (int, bool) {
 	}
 }
 
+// isRunIDAlias reports whether name is one of the engine's run ID aliases.
 func isRunIDAlias(name string) bool {
 	return name == "id" || name == "RunId"
 }
 
+// templateUsesRunID reports whether a template reads the run ID namespace.
 func templateUsesRunID(v any) bool {
 	switch t := v.(type) {
 	case map[string]any:
@@ -885,6 +893,8 @@ func templateUsesRunID(v any) bool {
 	return false
 }
 
+// taskVersion returns the effective version for a document task or builtin
+// task.
 func (e *Engine) taskVersion(name string) string {
 	if task, ok := e.doc.Tasks[name]; ok {
 		if task.Version != "" {
@@ -904,14 +914,14 @@ func (e *Engine) taskVersion(name string) string {
 	return "1"
 }
 
+// nodeResult carries the node ID and output for a completed or cached node.
 type nodeResult struct {
 	NodeID string
 	Output any
 }
 
-// decodeCachedOutput reconstructs a node output from its stored JSON document.
-// An absent or explicit-null payload decodes to nil, matching how a fresh run
-// would surface a nil output.
+// decodeCachedOutput decodes a stored JSON payload into the in-memory output
+// value.
 func decodeCachedOutput(raw json.RawMessage) (any, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -923,6 +933,8 @@ func decodeCachedOutput(raw json.RawMessage) (any, error) {
 	return v, nil
 }
 
+// scopeState carries the template namespaces visible at the current execution
+// point.
 type scopeState struct {
 	input     map[string]any
 	constants map[string]any
@@ -934,11 +946,13 @@ type scopeState struct {
 	body      any
 }
 
+// clone makes a shallow copy of the current scope for child evaluation.
 func (s *scopeState) clone() *scopeState {
 	c := *s
 	return &c
 }
 
+// withItem returns a child scope whose item and index shadow outer values.
 func (s *scopeState) withItem(item any, index int) *scopeState {
 	c := s.clone()
 	c.item = item
@@ -946,24 +960,28 @@ func (s *scopeState) withItem(item any, index int) *scopeState {
 	return c
 }
 
+// withIndex returns a child scope whose index shadows the outer value.
 func (s *scopeState) withIndex(index int) *scopeState {
 	c := s.clone()
 	c.index = &index
 	return c
 }
 
+// withState returns a child scope whose state shadows the outer value.
 func (s *scopeState) withState(state map[string]any) *scopeState {
 	c := s.clone()
 	c.state = state
 	return c
 }
 
+// withBody returns a child scope whose body output shadows the outer value.
 func (s *scopeState) withBody(body any) *scopeState {
 	c := s.clone()
 	c.body = body
 	return c
 }
 
+// resolveTemplate resolves a template against the active execution scope.
 func resolveTemplate(template any, scope *scopeState) (any, error) {
 	switch t := template.(type) {
 	case nil:
@@ -999,6 +1017,8 @@ func resolveTemplate(template any, scope *scopeState) (any, error) {
 	}
 }
 
+// resolveRef reads a value from a scope namespace and applies any path
+// projection.
 func resolveRef(from string, ref map[string]any, scope *scopeState) (any, error) {
 	var value any
 	switch from {
@@ -1042,6 +1062,7 @@ func resolveRef(from string, ref map[string]any, scope *scopeState) (any, error)
 	return value, nil
 }
 
+// project looks up a named child in a map-backed object.
 func project(value any, segment string) (any, bool) {
 	if obj, ok := value.(map[string]any); ok {
 		v, exists := obj[segment]
@@ -1050,6 +1071,7 @@ func project(value any, segment string) (any, bool) {
 	return nil, false
 }
 
+// collectRefs returns node references found anywhere in a template value.
 func collectRefs(v any) []string {
 	set := map[string]bool{}
 	var walk func(any)

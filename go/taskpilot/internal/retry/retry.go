@@ -170,7 +170,8 @@ func Run(ctx context.Context, opts Options, body func(context.Context) (any, err
 	return nil, lastErr
 }
 
-// fibonacciBackoff returns the nth Fibonacci number × initialBackoff, capped at maxBackoff.
+// fibonacciBackoff returns the nth Fibonacci number × initialBackoff, capped at
+// maxBackoff.
 func fibonacciBackoff(attempt int, initialBackoff, maxBackoff time.Duration) time.Duration {
 	if attempt < 1 {
 		attempt = 1

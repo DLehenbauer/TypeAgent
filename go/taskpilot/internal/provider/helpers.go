@@ -5,6 +5,7 @@ import (
 	"fmt"
 )
 
+// asString converts a provider input value to a string.
 func asString(v any) string {
 	if v == nil {
 		return ""
@@ -12,6 +13,7 @@ func asString(v any) string {
 	return fmt.Sprint(v)
 }
 
+// intValue converts numeric-like provider input values to ints when exact.
 func intValue(v any) (int, bool) {
 	switch n := v.(type) {
 	case int:

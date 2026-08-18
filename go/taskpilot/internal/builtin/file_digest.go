@@ -8,19 +8,18 @@ import (
 	"os"
 )
 
-// absentFingerprint is the stable sentinel returned for a missing file, shared
-// by every producer and test so the value has a single definition site.
+// absentFingerprint is the stable sentinel used when a file-dependent digest
+// references a missing file.
 const absentFingerprint = "absent"
 
-// fileContentDigest hashes the content of the file named by input["path"] so a
-// content-addressed node re-runs when the file changes and cache-hits when it
-// does not. A missing file yields a stable absentFingerprint sentinel rather
-// than an error, keeping identity computable; the task's own execution surfaces
-// the missing-file error if it matters.
+// fileContentDigest hashes the content of input["path"]. Missing files produce
+// absentFingerprint so cache identity stays deterministic.
 func fileContentDigest(input map[string]any) (string, error) {
 	return hashFileContent(asString(input["path"]))
 }
 
+// hashFileContent returns the SHA-256 content digest for path, or
+// absentFingerprint when path does not exist.
 func hashFileContent(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -37,8 +36,8 @@ func hashFileContent(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// fileExistsDigest captures only presence/absence, the sole external state that
-// changes file.exists output. Content is irrelevant to the result.
+// fileExistsDigest records only whether input["path"] exists; content changes
+// do not affect file.exists.
 func fileExistsDigest(input map[string]any) (string, error) {
 	present, err := filePresent(asString(input["path"]))
 	if err != nil {
@@ -50,10 +49,8 @@ func fileExistsDigest(input map[string]any) (string, error) {
 	return absentFingerprint, nil
 }
 
-// globDigest hashes the sorted set of matched relative paths. Content changes do
-// not alter file.glob output (it reports paths, not contents), so they are
-// intentionally excluded; downstream file.ref nodes capture content via their
-// own digest. The digest invalidates on add/remove/rename of matches.
+// globDigest hashes the sorted file.glob match set. It intentionally ignores
+// file content because file.glob returns paths only.
 func globDigest(input map[string]any) (string, error) {
 	in := decodeGlobInput(input)
 	rels, err := globRelPaths(in.Root, in.Pattern)

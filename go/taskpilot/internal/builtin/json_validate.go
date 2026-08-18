@@ -31,6 +31,8 @@ var jsonValidateSpec = model.TaskSpec{
 	},
 }
 
+// validateJSON validates input["value"] against input["schema"] and returns
+// "valid", plus "error" when validation fails.
 func validateJSON(_ context.Context, input map[string]any, _ Context) (any, error) {
 	err := schema.Validate(input[jsonValidateSchemaField], input[jsonValidateValueField])
 	out := map[string]any{jsonValidateValidField: err == nil}

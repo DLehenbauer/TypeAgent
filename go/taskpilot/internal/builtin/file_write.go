@@ -9,9 +9,8 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 )
 
-// fileWriteInput is the input for the file.write task, which writes Content to
-// the file at Path. Path is created or truncated and written with 0666 mode
-// (subject to umask); both fields are required. On dry-run nothing is written.
+// fileWriteInput is the input for file.write. The destination path is created
+// or truncated and written with mode 0666 under the current umask.
 type fileWriteInput struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
@@ -23,6 +22,8 @@ var fileWriteSpec = model.TaskSpec{
 	InputSchema: structToSchema(reflect.TypeOf(fileWriteInput{})),
 }
 
+// writeFile writes content to path and returns the written path. Dry runs
+// validate input but leave the file untouched.
 func writeFile(_ context.Context, input map[string]any, ctx Context) (any, error) {
 	in, err := decodeInput[fileWriteInput](input)
 	if err != nil {
@@ -40,6 +41,8 @@ func writeFile(_ context.Context, input map[string]any, ctx Context) (any, error
 	return in.Path, nil
 }
 
+// fileWriteDigest validates input and returns the current content digest for
+// input["path"].
 func fileWriteDigest(input map[string]any) (string, error) {
 	if asString(input["path"]) == "" {
 		return "", fmt.Errorf("file.write: path must not be empty")

@@ -123,8 +123,10 @@ func NewBackend(limit int) *Backend {
 	}
 }
 
+// Kind reports the Hyper-V target kind used by this backend.
 func (h *Backend) Kind() target.Kind { return Kind }
 
+// Acquire requests a lease for a Hyper-V VM and returns the instance metadata.
 func (h *Backend) Acquire(ctx context.Context, req target.AcquireRequest) (target.Instance, error) {
 	out, err := h.gate.run(ctx, func(ctx context.Context) (any, error) {
 		return h.acquire(ctx, req)
@@ -138,6 +140,7 @@ func (h *Backend) Acquire(ctx context.Context, req target.AcquireRequest) (targe
 	}, nil
 }
 
+// acquire takes a VM lease and records the instance state.
 func (h *Backend) acquire(ctx context.Context, req target.AcquireRequest) (hyperVAcquireResult, error) {
 	opts, err := decodeHyperVOptions(req.Options)
 	if err != nil {
@@ -162,6 +165,7 @@ func (h *Backend) acquire(ctx context.Context, req target.AcquireRequest) (hyper
 		}
 	}()
 
+	// Reject duplicate leases before invoking Hyper-V so the process-local map stays consistent.
 	h.mu.Lock()
 	if _, exists := h.instances[opts.VMName]; exists {
 		h.mu.Unlock()
@@ -206,6 +210,7 @@ func (h *Backend) acquire(ctx context.Context, req target.AcquireRequest) (hyper
 	return acquired, nil
 }
 
+// Release drops the process-local lease and removes the VM when keep is false.
 func (h *Backend) Release(ctx context.Context, id string, keep bool) error {
 	_, err := h.gate.run(ctx, func(ctx context.Context) (any, error) {
 		return nil, h.release(ctx, id, keep)
@@ -213,6 +218,7 @@ func (h *Backend) Release(ctx context.Context, id string, keep bool) error {
 	return err
 }
 
+// release removes the local lease and deletes the VM unless the caller wants to keep it.
 func (h *Backend) release(ctx context.Context, id string, keep bool) error {
 	inst := h.takeInstance(id)
 	if inst == nil {
@@ -232,6 +238,7 @@ func (h *Backend) release(ctx context.Context, id string, keep bool) error {
 	return removeHyperVMetadata(stateDir, id)
 }
 
+// Run executes a guest script and returns the decoded result for the request.
 func (h *Backend) Run(ctx context.Context, req target.RunRequest) (target.RunOutcome, error) {
 	out, err := h.gate.run(ctx, func(ctx context.Context) (any, error) {
 		return h.exec(ctx, req)
@@ -246,6 +253,7 @@ func (h *Backend) Run(ctx context.Context, req target.RunRequest) (target.RunOut
 	return outcome, nil
 }
 
+// exec runs a script against the acquired guest and persists checkpoint metadata.
 func (h *Backend) exec(ctx context.Context, req target.RunRequest) (target.RunOutcome, error) {
 	if req.ID == "" {
 		return target.RunOutcome{}, fmt.Errorf("hyperv: run requires an id")
@@ -299,10 +307,7 @@ func (h *Backend) exec(ctx context.Context, req target.RunRequest) (target.RunOu
 	}
 	committed := false
 	if req.Checkpoint != "" && run.ExitCode == 0 {
-		// A layer that changes boot-time state (testsigning, driver install)
-		// reports it, and the reboot must happen BEFORE the checkpoint: a
-		// checkpoint taken pre-reboot would capture state the guest has not
-		// actually applied yet, and every later restore would replay it.
+		// Reboot before checkpointing when the guest requested it so the checkpoint reflects the applied state.
 		if hyperVWantsReboot(result) {
 			if err := h.runner.RebootGuest(ctx, inst.opts, req.ID); err != nil {
 				h.setDirty(req.ID, req.State)
@@ -320,10 +325,7 @@ func (h *Backend) exec(ctx context.Context, req target.RunRequest) (target.RunOu
 		h.setMaterializedState(req.ID, req.Checkpoint)
 		committed = true
 	} else {
-		// A non-zero exit is an ordinary result rather than a call failure, so an
-		// ensure body can "succeed" without converging. Leaving committed false is
-		// what stops the caller advancing the lease to a checkpoint that was
-		// never taken.
+		// A non-zero exit is an ordinary script result rather than a call failure, so the checkpoint remains uncommitted.
 		h.setDirty(req.ID, req.State)
 	}
 	if err := touchHyperVInstance(stateDir, req.ID, h.logicalStateOf(req.ID)); err != nil {
@@ -332,9 +334,7 @@ func (h *Backend) exec(ctx context.Context, req target.RunRequest) (target.RunOu
 	return target.RunOutcome{Result: result, Committed: committed}, nil
 }
 
-// logicalStateOf reads an instance's current logical state under the lock. The
-// field is written by setDirty/setMaterializedState from other goroutines, so
-// reading it directly off a captured instance pointer would be a data race.
+// logicalStateOf returns the current logical checkpoint for an acquired VM.
 func (h *Backend) logicalStateOf(id string) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -344,11 +344,7 @@ func (h *Backend) logicalStateOf(id string) string {
 	return ""
 }
 
-// hyperVWantsReboot reports whether a guest body asked for a restart. The flag
-// travels in the body's own JSON result under "rebootRequested", so a layer
-// declares its need for a reboot rather than performing one itself -- a body
-// that restarted the guest underneath the session would sever the connection
-// mid-run.
+// hyperVWantsReboot reports whether a guest body requested a restart.
 func hyperVWantsReboot(result script.Result) bool {
 	inner, ok := result.Value.(map[string]any)
 	if !ok {
@@ -364,6 +360,7 @@ func hyperVWantsReboot(result script.Result) bool {
 	}
 }
 
+// Sweep removes stale checkpoints and old VMs that have aged past the cutoff.
 func (h *Backend) Sweep(ctx context.Context, maxAge time.Duration) (int, error) {
 	out, err := h.gate.run(ctx, func(ctx context.Context) (any, error) {
 		return h.sweep(ctx, maxAge)
@@ -374,6 +371,7 @@ func (h *Backend) Sweep(ctx context.Context, maxAge time.Duration) (int, error) 
 	return out.(int), nil
 }
 
+// sweep removes expired checkpoints and VMs from the host and metadata store.
 func (h *Backend) sweep(ctx context.Context, maxAge time.Duration) (int, error) {
 	stateDir, err := cache.ResolveStateDir()
 	if err != nil {
@@ -399,8 +397,7 @@ func (h *Backend) sweep(ctx context.Context, maxAge time.Duration) (int, error) 
 		if !lock.Held() {
 			continue
 		}
-		// Hold the VM lock across removal so a freshly acquired lease cannot race
-		// with sweep after the stale check but before the destructive operation.
+		// Hold the VM lock across removal so a freshly acquired lease cannot race with sweep.
 		opts := hyperVOptions{VMName: meta.ID}
 		if err := h.runner.RemoveCheckpoint(ctx, opts, meta.ID, meta.State); err != nil {
 			if firstErr == nil {
@@ -445,6 +442,7 @@ func (h *Backend) sweep(ctx context.Context, maxAge time.Duration) (int, error) 
 	return removed, firstErr
 }
 
+// Close tears down all active instances and removes any VM that is not kept on failure.
 func (h *Backend) Close() {
 	h.mu.Lock()
 	instances := h.instances
@@ -464,6 +462,7 @@ func (h *Backend) Close() {
 	}
 }
 
+// requireInstance returns the active VM record or an error when it is not acquired.
 func (h *Backend) requireInstance(id string) (*hyperVInstance, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -474,6 +473,7 @@ func (h *Backend) requireInstance(id string) (*hyperVInstance, error) {
 	return inst, nil
 }
 
+// takeInstance removes and returns an active VM record.
 func (h *Backend) takeInstance(id string) *hyperVInstance {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -482,6 +482,7 @@ func (h *Backend) takeInstance(id string) *hyperVInstance {
 	return inst
 }
 
+// setLogicalState updates the logical checkpoint stored in the process-local instance map.
 func (h *Backend) setLogicalState(id, state string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -490,6 +491,7 @@ func (h *Backend) setLogicalState(id, state string) {
 	}
 }
 
+// setMaterializedState updates the logical and materialized checkpoints together.
 func (h *Backend) setMaterializedState(id, state string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -499,6 +501,7 @@ func (h *Backend) setMaterializedState(id, state string) {
 	}
 }
 
+// setDirty overwrites the logical checkpoint and clears the materialized one.
 func (h *Backend) setDirty(id, logicalState string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -508,6 +511,7 @@ func (h *Backend) setDirty(id, logicalState string) {
 	}
 }
 
+// materialize restores the requested checkpoint before a guest run when needed.
 func (h *Backend) materialize(ctx context.Context, inst *hyperVInstance, state string) error {
 	if err := inst.lock.Touch(); err != nil {
 		return err
@@ -532,6 +536,7 @@ func (h *Backend) materialize(ctx context.Context, inst *hyperVInstance, state s
 	return nil
 }
 
+// decodeHyperVOptions converts the request map into a validated Hyper-V configuration.
 func decodeHyperVOptions(input map[string]any) (hyperVOptions, error) {
 	stateDir, err := cache.ResolveStateDir()
 	if err != nil {
@@ -618,6 +623,7 @@ func decodeHyperVOptions(input map[string]any) (hyperVOptions, error) {
 	return opts, nil
 }
 
+// decodeHyperVGuestOptions validates guest connection settings and resolves the password from the environment.
 func decodeHyperVGuestOptions(raw any, defaults hyperVGuestOptions) (hyperVGuestOptions, error) {
 	input, ok := raw.(map[string]any)
 	if !ok {
@@ -667,6 +673,7 @@ func decodeHyperVGuestOptions(raw any, defaults hyperVGuestOptions) (hyperVGuest
 	return opts, nil
 }
 
+// decodeHyperVWorkspaceOptions validates UNC workspace credentials and resolves the password from the environment.
 func decodeHyperVWorkspaceOptions(raw any) (*hyperVWorkspaceOptions, error) {
 	input, ok := raw.(map[string]any)
 	if !ok {
@@ -706,6 +713,7 @@ func decodeHyperVWorkspaceOptions(raw any) (*hyperVWorkspaceOptions, error) {
 	return opts, nil
 }
 
+// hyperVStringOption validates a string option from the request map.
 func hyperVStringOption(name string, value any) (string, error) {
 	out, ok := value.(string)
 	if !ok {
@@ -714,6 +722,7 @@ func hyperVStringOption(name string, value any) (string, error) {
 	return out, nil
 }
 
+// hyperVIntOption validates an integer option from the request map.
 func hyperVIntOption(name string, value any) (int, error) {
 	out, ok := intValue(value)
 	if !ok {
@@ -722,6 +731,7 @@ func hyperVIntOption(name string, value any) (int, error) {
 	return out, nil
 }
 
+// stableHyperVName derives a deterministic VM name from identity options.
 func stableHyperVName(opts hyperVOptions) string {
 	type identity struct {
 		BaseImage         string `json:"baseImage"`
@@ -749,6 +759,8 @@ func stableHyperVName(opts hyperVOptions) string {
 
 var invalidHyperVName = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
 
+// sanitizeHyperVName normalizes a value to the allowed Hyper-V name characters
+// and length.
 func sanitizeHyperVName(s string) string {
 	s = strings.Trim(invalidHyperVName.ReplaceAllString(s, "-"), "-.")
 	if s == "" {
@@ -760,6 +772,7 @@ func sanitizeHyperVName(s string) string {
 	return s
 }
 
+// hyperVScriptResult converts a PowerShell run result into the common script.Result format.
 func hyperVScriptResult(run hyperVRunResult) (script.Result, error) {
 	return script.NewResult(run.Stdout, run.Stderr, run.ExitCode, run.TimedOut)
 }
@@ -804,6 +817,7 @@ func (r *psHyperVRunner) RemoveCheckpoint(ctx context.Context, opts hyperVOption
 	return r.run(ctx, "removeCheckpoint", map[string]any{"options": opts, "id": id, "state": state}, nil)
 }
 
+// run invokes the embedded PowerShell driver with a JSON payload and decodes the response.
 func (r *psHyperVRunner) run(ctx context.Context, action string, payload map[string]any, out any) error {
 	if r.command == nil {
 		r.command = execRunner{}
@@ -867,19 +881,23 @@ var hyperVAssetNames = []string{"driver.ps1", "host.psm1", "guest.psm1", "retry.
 //go:embed driver.ps1 host.psm1 guest.psm1 retry.ps1
 var hyperVAssets embed.FS
 
+// hyperVMLock records a VM lease-file acquisition shared across processes.
 type hyperVMLock struct {
 	path string
 	info hyperVMLockInfo
 	held bool
 }
 
+// hyperVMLockInfo stores the owner identity recorded in a VM lock file.
 type hyperVMLockInfo struct {
 	PID        int       `json:"pid"`
 	AcquiredAt time.Time `json:"acquiredAt"`
 }
 
+// Held reports whether acquisition was cached as successful.
 func (l hyperVMLock) Held() bool { return l.held }
 
+// Release removes the lock file when this process still owns it.
 func (l hyperVMLock) Release() error {
 	if !l.held {
 		return nil
@@ -904,6 +922,7 @@ func (l hyperVMLock) Release() error {
 	return nil
 }
 
+// Touch refreshes the lock mtime and verifies that the file still belongs to this process.
 func (l hyperVMLock) Touch() error {
 	if !l.held {
 		return nil
@@ -926,6 +945,7 @@ func (l hyperVMLock) Touch() error {
 	return os.Chtimes(l.path, now, now)
 }
 
+// acquireHyperVMLock creates a lease file for the VM or returns an unheld lock when the existing lock cannot be taken.
 func acquireHyperVMLock(stateDir, id string) (hyperVMLock, error) {
 	root := hyperVMLockRoot(stateDir)
 	if err := os.MkdirAll(root, 0o777); err != nil {
@@ -965,12 +985,7 @@ func acquireHyperVMLock(stateDir, id string) (hyperVMLock, error) {
 	}
 }
 
-// hyperVMLockStale reports whether a lock file can be taken over. A lock is
-// stale when its owner is gone: an interrupted or killed run would otherwise
-// wedge the VM until the max-age grace period expired, which is the difference
-// between "press Ctrl+C and rerun" and "wait an hour". The age check remains as
-// a backstop for locks whose owner cannot be identified (an unreadable or
-// truncated file, or a lock written by a different machine).
+// hyperVMLockStale reports whether a missing, expired, or dead-owner lock can be taken over.
 func hyperVMLockStale(path string) (bool, error) {
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -984,8 +999,7 @@ func hyperVMLockStale(path string) (bool, error) {
 	}
 	owner, err := readHyperVMLockInfo(path)
 	if err != nil {
-		// An unreadable lock is not proof the owner is gone, so fall back to
-		// the age rule rather than stealing a live lock.
+		// An unreadable lock is not proof the owner is gone; the age rule above is the backstop.
 		return false, nil
 	}
 	if owner.PID <= 0 {
@@ -994,6 +1008,7 @@ func hyperVMLockStale(path string) (bool, error) {
 	return !hyperVProcessAlive(owner.PID), nil
 }
 
+// readHyperVMLockInfo loads the owner identity stored in a VM lease file.
 func readHyperVMLockInfo(path string) (hyperVMLockInfo, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -1006,16 +1021,17 @@ func readHyperVMLockInfo(path string) (hyperVMLockInfo, error) {
 	return info, nil
 }
 
-// hyperVProcessAlive is a variable so tests can decide liveness without having
-// to arrange for a real process to exist or exit.
+// hyperVProcessAlive is a variable so tests can decide liveness without arranging for a real process.
 var hyperVProcessAlive = processAlive
 
+// hyperVInstanceMeta stores the last-used timestamp and baseline state for a VM record.
 type hyperVInstanceMeta struct {
 	ID            string    `json:"id"`
 	BaselineState string    `json:"baselineState"`
 	LastUsed      time.Time `json:"lastUsed"`
 }
 
+// hyperVCheckpointMeta stores the checkpoint state, timestamp, and persisted result payload.
 type hyperVCheckpointMeta struct {
 	ID       string         `json:"id"`
 	State    string         `json:"state"`
@@ -1023,6 +1039,7 @@ type hyperVCheckpointMeta struct {
 	Result   *script.Result `json:"result,omitempty"`
 }
 
+// touchHyperVInstance writes or refreshes the VM metadata file for the state store.
 func touchHyperVInstance(stateDir, id, baseline string) error {
 	path := filepath.Join(hyperVInstanceRoot(stateDir), safeFileName(id)+".json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
@@ -1035,6 +1052,7 @@ func touchHyperVInstance(stateDir, id, baseline string) error {
 	return os.WriteFile(path, raw, 0o666)
 }
 
+// touchHyperVCheckpoint writes checkpoint metadata, preserving the prior result when no new result is supplied.
 func touchHyperVCheckpoint(stateDir, id, state string, result ...script.Result) error {
 	path := hyperVCheckpointPath(stateDir, id, state)
 	if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
@@ -1053,6 +1071,7 @@ func touchHyperVCheckpoint(stateDir, id, state string, result ...script.Result) 
 	return os.WriteFile(path, raw, 0o666)
 }
 
+// readHyperVCheckpointResult loads a checkpoint result and normalizes numbers for structured replay.
 func readHyperVCheckpointResult(stateDir, id, state string) (script.Result, bool) {
 	meta, err := readHyperVCheckpoint(hyperVCheckpointPath(stateDir, id, state))
 	if err != nil || meta.Result == nil {
@@ -1062,6 +1081,7 @@ func readHyperVCheckpointResult(stateDir, id, state string) (script.Result, bool
 	return *meta.Result, true
 }
 
+// normalizeHyperVCheckpointResult recursively coerces JSON numbers to the Go values expected by replay.
 func normalizeHyperVCheckpointResult(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -1135,6 +1155,8 @@ func hyperVCheckpointPath(stateDir, id, state string) string {
 	return filepath.Join(hyperVCheckpointRoot(stateDir), safeFileName(id), safeFileName(state)+".json")
 }
 
+// safeFileName returns a stable metadata key, hashing names outside the narrow
+// character and length filter.
 func safeFileName(s string) string {
 	if s == "" {
 		return "_"

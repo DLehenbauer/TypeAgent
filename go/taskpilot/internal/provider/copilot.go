@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
+	copilot "github.com/github/copilot-sdk/go"
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/retry"
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/schema"
-	copilot "github.com/github/copilot-sdk/go"
 )
 
 // Copilot input keys. These name the fields of the copilot.invoke task schema
@@ -35,9 +35,11 @@ const (
 	copilotKeyMaxValidationAttempts     = "maxValidationAttempts"
 )
 
-// defaultCopilotPolicy is the conservative transient-retry policy applied when
-// the node does not override the maxAttempts/backoff knobs. It is built fresh on
-// each call so callers cannot mutate a shared package-level default.
+// defaultCopilotPolicy returns the transient-retry policy used when the node
+// does not override the retry knobs. MaxAttempts is the total number of tries,
+// including the first attempt, and the zero jitter field leaves backoff
+// deterministic. A fresh value is returned so callers cannot mutate a shared
+// default.
 func defaultCopilotPolicy() retry.Policy {
 	return retry.Policy{
 		MaxAttempts:    5,
@@ -83,27 +85,19 @@ type CopilotClient interface {
 	Open(ctx context.Context, opts CopilotOptions) (CopilotSession, error)
 }
 
-// sdkClient is the default CopilotClient backed by the Copilot SDK. A single
-// underlying copilot.Client -- i.e. a single CLI server process -- is shared
-// across every invocation; each Open creates a session on that shared client
-// and the returned session's Close disconnects only that session. Spawning one
-// process per invocation is what previously drove the machine to OOM, so the
-// process is started lazily on first use and reused thereafter. Close stops the
-// shared client and its process.
+// sdkClient tracks a shared Copilot SDK client and the lazily started CLI
+// process behind it.
 type sdkClient struct {
 	mu      sync.Mutex
 	client  *copilot.Client
 	started bool
 }
 
-// newSDKClient returns an sdkClient with no process running yet; the shared
-// client is started on the first Open.
+// newSDKClient returns an SDK-backed client with no process running yet.
 func newSDKClient() *sdkClient { return &sdkClient{} }
 
-// ensureClient starts the shared CLI server process exactly once and returns
-// it. Concurrent first-callers serialize on the mutex so only one process is
-// spawned; a failed start leaves the client unstarted so a later Open (or the
-// provider's transient retry) can try again.
+// ensureClient starts the shared CLI process once and returns the cached client.
+// A failed start leaves the client unstarted so a later Open can retry.
 func (c *sdkClient) ensureClient(ctx context.Context) (*copilot.Client, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -165,20 +159,20 @@ func (c *sdkClient) Close() {
 	}
 }
 
-// sdkSession is the SDK-backed CopilotSession returned by sdkClient.Open. It
-// wraps a single session on the shared client; Close disconnects only this
-// session and leaves the shared client running for other sessions.
+// sdkSession wraps a single Copilot SDK session and applies the session idle
+// timeout to each send.
 type sdkSession struct {
 	session     *copilot.Session
 	idleTimeout int
 }
 
-// Send issues one prompt on the session and waits for the assistant reply,
-// bounding the wait by the configured idle timeout when set. A nil reply yields
-// an empty CopilotReply; a non-assistant reply is returned with IsAssistant
-// false so the provider can pass it through untouched.
+// Send issues one prompt on the session and waits for the assistant reply, bounding
+// the wait by the configured idle timeout when set. A nil reply yields an empty
+// CopilotReply; a non-assistant reply is stringified and returned with
+// IsAssistant false.
 func (s *sdkSession) Send(ctx context.Context, prompt string) (CopilotReply, error) {
 	sendCtx := ctx
+	// Bound the wait so a stalled session cannot hold the call forever.
 	if s.idleTimeout > 0 {
 		var cancel context.CancelFunc
 		sendCtx, cancel = context.WithTimeout(ctx, time.Duration(s.idleTimeout)*time.Second)
@@ -235,21 +229,17 @@ func (p *CopilotProvider) Close() {
 	}
 }
 
-// copilotConfig is the fully validated set of per-invocation pacing knobs parsed
-// once from the node input at the boundary: the transient-retry policy, the
-// validation-dialog turn budget, and the session idle timeout in seconds (0 =
-// unbounded). Parsing rejects any illegal override rather than silently
-// defaulting or clamping it later.
+// copilotConfig captures the validated per-invocation Copilot settings,
+// including the retry policy, validation budget, and idle timeout.
 type copilotConfig struct {
 	Policy             retry.Policy
 	ValidationAttempts int
 	SessionIdleTimeout int
 }
 
-// parseCopilotConfig validates every per-invocation knob the input carries and
-// returns them together. It surfaces the first invalid override as an error so
-// an illegal retry policy, validation budget, or idle timeout is rejected up
-// front instead of being silently defaulted or clamped deeper in the run.
+// parseCopilotConfig validates the per-invocation Copilot settings and returns
+// them together. It surfaces the first invalid override as an error so an
+// illegal retry policy, validation budget, or idle timeout is rejected up front.
 func parseCopilotConfig(input map[string]any) (copilotConfig, error) {
 	policy, err := policyFromInput(input, defaultCopilotPolicy())
 	if err != nil {
@@ -288,6 +278,8 @@ func (p *CopilotProvider) Submit(ctx context.Context, req Request) Future {
 	})
 }
 
+// run executes one Copilot request to completion, including session setup,
+// transient retry, and schema validation.
 func (p *CopilotProvider) run(ctx context.Context, req Request) (Result, error) {
 	input := req.Input
 	cfg, err := parseCopilotConfig(input)
@@ -367,9 +359,8 @@ func (p *CopilotProvider) run(ctx context.Context, req Request) (Result, error) 
 	return nil, fmt.Errorf("copilot reply failed validation after %d attempt(s): %w", maxTurns, lastErr)
 }
 
-// openSession opens a Copilot session, replaying the open through the provided
-// transient-error retry options so throttling or connection blips during
-// startup do not surface as task failures.
+// openSession opens a Copilot session with transient retry so throttling or a
+// brief connection blip during startup does not fail the task.
 func (p *CopilotProvider) openSession(ctx context.Context, opts CopilotOptions, retryOpts retry.Options) (CopilotSession, error) {
 	out, err := retry.Run(ctx, retryOpts, func(ctx context.Context) (any, error) {
 		return p.client.Open(ctx, opts)
@@ -384,8 +375,9 @@ func (p *CopilotProvider) openSession(ctx context.Context, opts CopilotOptions, 
 	return session, nil
 }
 
-// sendTurn issues one conversation turn, replaying only transient failures.
-// Parse/schema handling is the caller's concern, not a transient error.
+// sendTurn sends one conversation turn with transient retry only. Parse and
+// schema handling are left to the caller rather than treated as network
+// failures.
 func (p *CopilotProvider) sendTurn(ctx context.Context, session CopilotSession, prompt string, retryOpts retry.Options) (CopilotReply, error) {
 	out, err := retry.Run(ctx, retryOpts, func(ctx context.Context) (any, error) {
 		return session.Send(ctx, prompt)
@@ -396,8 +388,8 @@ func (p *CopilotProvider) sendTurn(ctx context.Context, session CopilotSession, 
 	return out.(CopilotReply), nil
 }
 
-// parseContextTier validates the config-supplied context tier and returns the
-// typed value. An empty string leaves the tier unset (the model's default).
+// parseContextTier parses the config-supplied context tier. An empty string
+// leaves the tier unset so the model's default remains in effect.
 func parseContextTier(s string) (copilot.ContextTier, error) {
 	switch copilot.ContextTier(s) {
 	case "":
@@ -409,6 +401,8 @@ func parseContextTier(s string) (copilot.ContextTier, error) {
 	}
 }
 
+// buildPrompt builds the Copilot prompt and appends any context JSON or schema
+// guidance.
 func buildPrompt(input map[string]any) (string, error) {
 	var b strings.Builder
 	b.WriteString(asString(input[copilotKeyPrompt]))
@@ -448,9 +442,9 @@ func buildPrompt(input map[string]any) (string, error) {
 const defaultValidationAttempts = 3
 
 // validationAttempts returns the maximum number of conversation turns allowed
-// while coaxing a parseable, schema-valid reply out of the model, honoring the
-// node's maxValidationAttempts override when set. A present-but-illegal
-// override is rejected rather than silently falling back to the default.
+// while coaxing a parseable, schema-valid reply from the model. It honors the
+// node's maxValidationAttempts override when set and rejects an illegal
+// override.
 func validationAttempts(input map[string]any) (int, error) {
 	v, ok, err := positiveOverride(input, copilotKeyMaxValidationAttempts)
 	if err != nil {
@@ -462,10 +456,10 @@ func validationAttempts(input map[string]any) (int, error) {
 	return defaultValidationAttempts, nil
 }
 
-// sessionIdleTimeout returns the per-invocation session idle timeout in seconds,
-// or 0 (unbounded) when the node does not set sessionIdleTimeoutSeconds. A
-// present-but-illegal value is rejected rather than being silently clamped to
-// the unbounded default.
+// sessionIdleTimeout returns the per-invocation session idle timeout in
+// seconds, or 0 when the node does not set sessionIdleTimeoutSeconds. A
+// present-but-illegal value is rejected rather than silently clamped to the
+// unbounded default.
 func sessionIdleTimeout(input map[string]any) (int, error) {
 	v, ok, err := positiveOverride(input, copilotKeySessionIdleTimeoutSeconds)
 	if err != nil {
@@ -477,11 +471,9 @@ func sessionIdleTimeout(input map[string]any) (int, error) {
 	return 0, nil
 }
 
-// extractJSON returns the JSON payload from a model reply, stripping a
-// surrounding Markdown code fence (``` or ```json ... ```) when present.
-// Models frequently fence structured output despite being asked not to; this
-// keeps that habit from failing the parse. When no fence is found the trimmed
-// input is returned unchanged.
+// extractJSON returns the JSON payload from a model reply, stripping a leading
+// Markdown code fence when present. Models frequently fence structured output
+// despite being asked not to, and this keeps that habit from breaking parsing.
 func extractJSON(s string) string {
 	t := strings.TrimSpace(s)
 	if !strings.HasPrefix(t, "```") {
@@ -500,9 +492,9 @@ func extractJSON(s string) string {
 	return strings.TrimSpace(t)
 }
 
-// tryParseJSON parses content (tolerating a code fence) as JSON, reporting
-// whether it succeeded. It is used on the unstructured path where a JSON reply
-// is welcome but a plain-string reply is equally valid.
+// tryParseJSON attempts to parse content as JSON while tolerating a code fence.
+// It is used on the unstructured path where a JSON reply is welcome but a
+// plain-string reply is also acceptable.
 func tryParseJSON(content string) (any, bool) {
 	var value any
 	if err := json.Unmarshal([]byte(extractJSON(content)), &value); err != nil {
@@ -511,10 +503,10 @@ func tryParseJSON(content string) (any, bool) {
 	return value, true
 }
 
-// parseStructured parses content as JSON (tolerating a code fence) and, when
-// outputSchema is non-nil, validates the result against it. The returned error
-// is phrased for the model: it names the defect (invalid JSON or the specific
-// schema violation) so correctionPrompt can hand it back verbatim.
+// parseStructured parses content as JSON while tolerating a code fence and,
+// when outputSchema is non-nil, validates the result against it. The returned
+// error is phrased for the model so the validation loop can feed it back
+// verbatim.
 func parseStructured(content string, outputSchema any) (any, error) {
 	var value any
 	if err := json.Unmarshal([]byte(extractJSON(content)), &value); err != nil {
@@ -528,8 +520,9 @@ func parseStructured(content string, outputSchema any) (any, error) {
 	return value, nil
 }
 
-// correctionPrompt turns a parse/schema defect into the next conversation turn,
-// instructing the model to resend corrected JSON with no fence or prose.
+// correctionPrompt builds the next validation-turn prompt for a parse or schema
+// defect, instructing the model to resend corrected JSON without a fence or
+// prose.
 func correctionPrompt(err error) string {
 	return fmt.Sprintf("Your previous reply was rejected: %s\n\n"+
 		"Reply again with ONLY the corrected JSON value. Do not include any "+

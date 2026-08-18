@@ -44,6 +44,8 @@ type commandRunner interface {
 // execRunner is the default commandRunner backed by os/exec.
 type execRunner struct{}
 
+// Run starts pwsh with the supplied arguments and returns its captured output.
+// Non-exit execution errors discard any captured output.
 func (execRunner) Run(ctx context.Context, args []string, dir string) (string, string, int, error) {
 	cmd := exec.CommandContext(ctx, "pwsh", args...)
 	if dir != "" {
@@ -54,6 +56,8 @@ func (execRunner) Run(ctx context.Context, args []string, dir string) (string, s
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
+		// Converts a non-zero PowerShell exit into a regular result instead of a
+		// host-level execution failure so callers can decide how to handle it.
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return stdout.String(), stderr.String(), ee.ExitCode(), nil
@@ -90,6 +94,8 @@ func (p *PwshProvider) Submit(ctx context.Context, req Request) Future {
 	})
 }
 
+// run executes one PowerShell script request and maps its exit status into a
+// provider result.
 func (p *PwshProvider) run(ctx context.Context, req Request) (Result, error) {
 	decoded, err := script.Decode(req.Input, model.FileRefPath)
 	if err != nil {
@@ -99,6 +105,7 @@ func (p *PwshProvider) run(ctx context.Context, req Request) (Result, error) {
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(decoded.TimeoutSeconds)*time.Second)
 	defer cancel()
 
+	// Write the script to a temp file because pwsh -File accepts a path.
 	scriptFile, err := os.CreateTemp("", "taskpilot-pwsh-*.ps1")
 	if err != nil {
 		return nil, err

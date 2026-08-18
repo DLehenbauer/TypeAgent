@@ -22,15 +22,13 @@ var fileRefSpec = model.TaskSpec{
 	InputSchema: structToSchema(reflect.TypeOf(FileRefInput{})),
 }
 
-// makeFileRef produces a file-reference envelope for path. The fingerprint is
-// the SHA-256 of the file's content (an absent file yields the
-// absentFingerprint sentinel), so the reference -- and any downstream node it
-// feeds -- changes
-// when the file's content changes. Consumers read the file on demand rather
-// than receiving its bytes inline.
+// makeFileRef produces a file-reference envelope for input["path"]. The
+// non-dry-run fingerprint is the file content digest, with absentFingerprint
+// used for a missing file.
 func makeFileRef(_ context.Context, input map[string]any, ctx Context) (any, error) {
 	path := asString(input["path"])
 	if ctx.DryRun {
+		// Dry runs return a stable placeholder without inspecting the filesystem.
 		return model.FileRef(path, "dry-run"), nil
 	}
 	fp, err := hashFileContent(path)
@@ -46,13 +44,12 @@ var fileRefGlobSpec = model.TaskSpec{
 	InputSchema: structToSchema(reflect.TypeOf(globInput{})),
 }
 
-// makeFileRefGlob produces a file-reference envelope for every non-directory
-// file matching pattern under root, sorted by relative path. It is the batch
-// form of file.ref: a single node yields references for a whole match set,
-// which downstream nodes can fan out over.
+// makeFileRefGlob produces file-reference envelopes for every non-directory
+// file matching pattern under root, sorted by relative path.
 func makeFileRefGlob(_ context.Context, input map[string]any, ctx Context) (any, error) {
 	in := decodeGlobInput(input)
 	if ctx.DryRun {
+		// Dry-run returns the empty result shape without walking the filesystem.
 		return []any{}, nil
 	}
 	rels, err := globRelPaths(in.Root, in.Pattern)
@@ -71,11 +68,8 @@ func makeFileRefGlob(_ context.Context, input map[string]any, ctx Context) (any,
 	return out, nil
 }
 
-// globContentDigest is the external-state digester for file.refGlob. Unlike
-// globDigest (which hashes only the match set, since file.glob reports paths),
-// file.refGlob embeds each file's content fingerprint in its output, so its
-// identity must also fold in content: the node re-runs when any matched file's
-// content changes, not only when files are added or removed.
+// globContentDigest hashes the sorted file.refGlob match set and each match's
+// content fingerprint so path and content changes invalidate identity.
 func globContentDigest(input map[string]any) (string, error) {
 	in := decodeGlobInput(input)
 	rels, err := globRelPaths(in.Root, in.Pattern)

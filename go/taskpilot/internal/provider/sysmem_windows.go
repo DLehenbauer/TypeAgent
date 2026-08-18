@@ -6,7 +6,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// memoryStatusEx mirrors the Win32 MEMORYSTATUSEX structure.
+// memoryStatusEx mirrors the Win32 MEMORYSTATUSEX structure used by GlobalMemoryStatusEx.
 // https://learn.microsoft.com/windows/win32/api/sysinfoapi/ns-sysinfoapi-memorystatusex
 type memoryStatusEx struct {
 	length               uint32
@@ -22,9 +22,7 @@ type memoryStatusEx struct {
 
 var procGlobalMemoryStatusEx = windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalMemoryStatusEx")
 
-// probeTotalSystemMemory queries the total physical RAM installed on the
-// system, in bytes. The undetermined-memory fallback is applied by
-// getTotalSystemMemory, so this returns the raw probe error unchanged.
+// probeTotalSystemMemory reports total physical RAM in bytes from GlobalMemoryStatusEx.
 func probeTotalSystemMemory() (int64, error) {
 	var status memoryStatusEx
 	status.length = uint32(unsafe.Sizeof(status))

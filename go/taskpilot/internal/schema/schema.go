@@ -17,11 +17,8 @@ import (
 // first violation found. A nil schema accepts any value and returns nil. The
 // schema must be a JSON object (map[string]any); any other shape, including a
 // JSON boolean schema, is rejected as an error rather than silently accepted.
-// An otherwise invalid schema is reported as an error.
-//
-// This compiles the schema on every call. Callers that repeatedly validate the
-// same schemas (such as the engine across parallel node execution) should hold
-// a *Validator, which memoizes compiled schemas.
+// An otherwise invalid schema is reported as an error. Use Validator when
+// repeatedly validating against the same schemas.
 func Validate(schema any, value any) error {
 	rs, err := compile(schema)
 	if err != nil {
@@ -33,19 +30,17 @@ func Validate(schema any, value any) error {
 // Compile reports whether schema is a well-formed JSON Schema, returning a
 // descriptive error otherwise. A nil schema is well-formed. The schema must be
 // a JSON object; a non-object schema (such as a JSON boolean) is rejected.
-// Callers such as the verifier use this to reject malformed task/constant
-// schemas up front.
 func Compile(schema any) error {
 	_, err := compile(schema)
 	return err
 }
 
 // Validator validates values against schemas, memoizing compiled schemas keyed
-// by their canonical JSON. Go's json.Marshal emits object keys in sorted order,
+// by their JSON encoding. Go's json.Marshal emits object keys in sorted order,
 // so structurally identical schemas share a key. *jsonschema.Resolved is safe
-// for concurrent Validate, so a single Validator can be shared across the
-// engine's parallel node execution. The zero Validator is ready to use, but
-// prefer NewValidator for clarity.
+// for concurrent Validate, so one Validator can be shared across the engine's
+// parallel node execution. The zero Validator is ready to use, but prefer
+// NewValidator for clarity.
 type Validator struct {
 	cache sync.Map // string -> compiled
 }
@@ -127,7 +122,7 @@ func compile(schema any) (*jsonschema.Resolved, error) {
 	return resolve(raw)
 }
 
-// resolve parses and resolves canonical schema JSON into a *jsonschema.Resolved.
+// resolve parses and resolves schema JSON into a *jsonschema.Resolved.
 func resolve(raw []byte) (*jsonschema.Resolved, error) {
 	var s jsonschema.Schema
 	if err := json.Unmarshal(raw, &s); err != nil {
@@ -136,10 +131,8 @@ func resolve(raw []byte) (*jsonschema.Resolved, error) {
 	return s.Resolve(nil)
 }
 
-// normalize converts an arbitrary Go value into its JSON-native form (float64,
-// string, bool, nil, map[string]any, []any) as expected by jsonschema-go's
-// validator. This folds Go-typed inputs (int, structs, named slices) into the
-// shapes the validator understands.
+// normalize converts an arbitrary Go value into the JSON-native shapes expected
+// by the validator.
 func normalize(value any) (any, error) {
 	raw, err := json.Marshal(value)
 	if err != nil {

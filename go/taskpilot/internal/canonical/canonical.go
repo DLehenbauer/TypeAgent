@@ -16,8 +16,8 @@ const errPrefix = "canonical json"
 // JSON encodes v into a canonical, deterministic JSON byte slice per RFC 8785
 // (JSON Canonicalization Scheme): object keys are sorted, numbers use
 // ECMAScript formatting, and no insignificant whitespace is emitted, so equal
-// values always produce identical output. It returns an error if any value
-// cannot be marshaled by encoding/json.
+// values always produce identical output. It returns an error if v cannot be
+// marshaled or transformed into canonical JSON.
 func JSON(v any) ([]byte, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -30,10 +30,10 @@ func JSON(v any) ([]byte, error) {
 	return out, nil
 }
 
-// Hash returns the hex-encoded SHA-256 digest of the canonical JSON encoding of
-// the given domain and payload. The domain separates hashes of structurally
+// Hash returns the hex-encoded SHA-256 digest of a canonical JSON object with
+// domain and payload fields. The domain separates hashes of structurally
 // identical payloads used for different purposes. It returns an error if the
-// payload cannot be canonically encoded.
+// domain-scoped value cannot be canonically encoded.
 func Hash(domain string, payload any) (string, error) {
 	raw, err := JSON(map[string]any{"domain": domain, "payload": payload})
 	if err != nil {

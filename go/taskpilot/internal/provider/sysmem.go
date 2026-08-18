@@ -1,9 +1,7 @@
 package provider
 
-// getTotalSystemMemory returns the total physical RAM installed on the system,
-// in bytes. It returns 0 when the amount cannot be determined, applying the
-// undetermined-memory fallback contract in one place so the per-OS probes in
-// probeTotalSystemMemory can stay focused on querying the platform.
+// getTotalSystemMemory returns total physical RAM in bytes, or 0 when the
+// platform probe cannot determine it.
 func getTotalSystemMemory() int64 {
 	bytes, err := probeTotalSystemMemory()
 	if err != nil {

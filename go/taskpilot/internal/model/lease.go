@@ -8,29 +8,15 @@ const (
 	leaseStateField = "state"
 )
 
-// A lease envelope has the shape
-// {"$lease": {"kind": ..., "id": ..., "state": ...}}.
-//
-// A lease is a linear claim on an external execution context. It names which
-// kind of context (hyperv, and later ssh, container, ...), which physical
-// instance currently backs it, and the state that instance is at.
-//
-// Identity folds in {kind, state} only. The physical id is excluded
-// so a graph is stable across different backing instances -- the same workflow
-// cache-hits whether it ran on VM A or VM B -- and any credential material is
-// excluded by never being carried here at all, so rotating a service password
-// cannot invalidate cached node IDs.
-//
 // Lease describes a claim on an external execution context. Kind selects the
-// provider that backs it, ID names the instance currently materializing it,
-// and State names the state that instance is at.
+// provider, ID names the backing instance, and State names its current state.
 type Lease struct {
 	Kind  string
 	ID    string
 	State string
 }
 
-// LeaseRef builds a lease envelope.
+// LeaseRef constructs a lease envelope.
 func LeaseRef(l Lease) map[string]any {
 	return map[string]any{leaseKey: map[string]any{
 		leaseKindField:  l.Kind,
@@ -76,6 +62,8 @@ func ProjectLeaseIdentityMap(inputs map[string]any) map[string]any {
 	return out
 }
 
+// projectLeaseIdentity normalizes a value for lease identity by stripping
+// runtime instance IDs while preserving provider kind and state.
 func projectLeaseIdentity(v any) any {
 	if lease, ok := AsLease(v); ok {
 		return map[string]any{leaseKey: map[string]any{

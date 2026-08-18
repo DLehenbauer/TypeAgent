@@ -58,6 +58,7 @@ type Registry struct {
 	byKind map[Kind]Backend
 }
 
+// NewRegistry creates a registry for the supplied backends.
 func NewRegistry(backends ...Backend) *Registry {
 	r := &Registry{byKind: map[Kind]Backend{}}
 	for _, backend := range backends {
@@ -66,6 +67,7 @@ func NewRegistry(backends ...Backend) *Registry {
 	return r
 }
 
+// Get returns the backend for kind if it is registered.
 func (r *Registry) Get(kind Kind) (Backend, bool) {
 	if r == nil {
 		return nil, false
@@ -76,6 +78,7 @@ func (r *Registry) Get(kind Kind) (Backend, bool) {
 	return backend, ok
 }
 
+// Require returns the backend for kind or an error if it is not registered.
 func (r *Registry) Require(kind Kind) (Backend, error) {
 	if backend, ok := r.Get(kind); ok {
 		return backend, nil
@@ -83,6 +86,7 @@ func (r *Registry) Require(kind Kind) (Backend, error) {
 	return nil, fmt.Errorf("no execution target registered for kind %q (registered: %s)", kind, r.Kinds())
 }
 
+// Kinds returns the registered backend kinds in stable sorted order.
 func (r *Registry) Kinds() string {
 	if r == nil {
 		return "none"
@@ -111,6 +115,7 @@ func join(items []string) string {
 	return out
 }
 
+// SweepAll sweeps all registered backends for stale state.
 func (r *Registry) SweepAll(ctx context.Context, maxAge time.Duration) (int, error) {
 	if r == nil {
 		return 0, nil
@@ -134,6 +139,7 @@ func (r *Registry) SweepAll(ctx context.Context, maxAge time.Duration) (int, err
 	return total, firstErr
 }
 
+// Close closes any backend resources that support a Close method.
 func (r *Registry) Close() {
 	if r == nil {
 		return

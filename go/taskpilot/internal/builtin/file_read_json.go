@@ -12,12 +12,9 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 )
 
-// FileReadJsonInput configures the file.readJson task. Path is required and
-// names the JSON file to read. MaxBytes caps the number of bytes accepted; when
-// omitted it defaults to 10 MiB, and when present it must be a positive integer
-// (non-positive values are rejected rather than silently coerced). Reads
-// exceeding the cap fail with an error. The file contents are parsed as JSON
-// and returned.
+// FileReadJsonInput configures the file.readJson task.
+// Path names the JSON file. MaxBytes caps the accepted byte count, defaults to
+// 10 MiB when omitted, and must be positive when set.
 type FileReadJsonInput struct {
 	Path     string `json:"path"`
 	MaxBytes int    `json:"maxBytes,omitempty"`
@@ -29,14 +26,11 @@ var fileReadJSONSpec = model.TaskSpec{
 	InputSchema: structToSchema(reflect.TypeOf(FileReadJsonInput{})),
 }
 
-// readJSONFile reads the file named by input["path"], enforcing the maxBytes
-// cap, and parses the contents as JSON. When maxBytes is omitted it defaults to
-// 10 MiB; when present it must be a positive integer, otherwise the read fails.
-// Reads exceeding the cap fail. File content that feeds an agent or script
-// should flow as a file reference (file.ref) rather than through a whole-file
-// read.
+// readJSONFile reads and parses a JSON file, enforcing maxBytes before
+// decoding.
 func readJSONFile(_ context.Context, input map[string]any, ctx Context) (any, error) {
 	if ctx.DryRun {
+		// Dry-run returns an empty object without reading disk.
 		return map[string]any{}, nil
 	}
 	path := asString(input["path"])
@@ -54,6 +48,8 @@ func readJSONFile(_ context.Context, input map[string]any, ctx Context) (any, er
 	}
 	defer f.Close()
 	var b bytes.Buffer
+	// Read one byte past the limit so oversized files fail without buffering the
+	// full payload.
 	if _, err := io.CopyN(&b, f, max+1); err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}

@@ -31,8 +31,8 @@ type FakeProvider struct {
 	requests []Request
 }
 
-// StaticResult builds a Respond function that returns the same value, and no
-// error, for every request.
+// StaticResult builds a Respond function that returns the same value and no
+// error for every request.
 func StaticResult(v Result) func(Request) (Result, error) {
 	return func(Request) (Result, error) { return v, nil }
 }
@@ -45,10 +45,11 @@ func (f *FakeProvider) Name() Name {
 	return f.ProviderName
 }
 
-// throttle lazily builds the shared throttle so all Submits observe one
-// concurrency cap rather than a fresh (and therefore ineffective) semaphore.
+// throttle builds the shared throttle once so every Submit call shares the same limit.
 func (f *FakeProvider) throttle() *throttle {
-	f.once.Do(func() { f.tr = newThrottle(f.Limit) })
+	f.once.Do(func() {
+		f.tr = newThrottle(f.Limit)
+	})
 	return f.tr
 }
 

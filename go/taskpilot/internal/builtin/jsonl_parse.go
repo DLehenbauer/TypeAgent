@@ -10,8 +10,7 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
 )
 
-// jsonlLineSeparator delimits records in the JSONL format shared by
-// jsonl.parse and jsonl.stringify.
+// jsonlLineSeparator separates records for jsonl.parse and jsonl.stringify.
 const jsonlLineSeparator = "\n"
 
 // JsonlParseInput is the input contract for jsonl.parse. Text is the required
@@ -27,6 +26,8 @@ var jsonlParseSpec = model.TaskSpec{
 	InputSchema: structToSchema(reflect.TypeOf(JsonlParseInput{})),
 }
 
+// parseJSONL parses input["text"] as newline-delimited JSON, ignoring blank
+// lines.
 func parseJSONL(_ context.Context, input map[string]any, _ Context) (any, error) {
 	text, ok := input["text"].(string)
 	if !ok {

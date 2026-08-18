@@ -48,7 +48,9 @@ type Name string
 // of truth for both a provider's Name() and the key callers use to look it up
 // in a Set.
 const (
-	NamePwsh    Name = "pwsh"
+	// NamePwsh identifies the PowerShell provider.
+	NamePwsh Name = "pwsh"
+	// NameCopilot identifies the Copilot provider.
 	NameCopilot Name = "copilot"
 )
 
@@ -58,11 +60,13 @@ type Provider interface {
 	Submit(ctx context.Context, req Request) Future
 }
 
+// result holds the outcome for one dispatched work item.
 type result struct {
 	value Result
 	err   error
 }
 
+// chanFuture carries a dispatched work item's result from its goroutine to Await.
 type chanFuture struct {
 	ch <-chan result
 }
@@ -76,22 +80,15 @@ func (f chanFuture) Await(ctx context.Context) (Result, error) {
 	}
 }
 
-// throttle bounds how many work items a provider runs concurrently. It is the
-// single seam where dispatch is gated: Submit stays non-blocking (it enqueues
-// and returns a Future immediately) while at most N items execute at once.
-// Excess submissions wait in the semaphore queue, so backpressure surfaces as
-// wait, never as rejected work. A nil throttle (or a non-positive limit) runs
-// every item immediately, preserving the original unbounded behavior.
-//
-// Concurrency is the only dimension enforced today. A rate limiter (e.g.
-// golang.org/x/time/rate) would plug into the same acquire step: wait for a
-// token, then a slot, before running fn.
+// throttle bounds how many work items a provider runs concurrently. It is the single
+// seam where dispatch is gated: Submit stays non-blocking while at most N items
+// execute at once. Backpressure shows up as waiting or cancellation, not rejection.
 type throttle struct {
 	sem *semaphore.Weighted
 }
 
-// newThrottle returns a throttle bounded to limit concurrent items. A limit of
-// zero or less yields an unbounded throttle.
+// newThrottle returns a throttle that caps concurrent work items. A limit of
+// zero or less leaves work unbounded.
 func newThrottle(limit int) *throttle {
 	if limit <= 0 {
 		return &throttle{}
@@ -100,11 +97,8 @@ func newThrottle(limit int) *throttle {
 }
 
 // dispatch runs fn in its own goroutine and returns a Future for the result.
-// The slot is acquired inside the goroutine so Submit never blocks. An item
-// cancelled while still queued returns ctx.Err() without ever running fn, so a
-// cancelled submission has no side effect. This is the single place where work
-// is dispatched, so a future pass can layer in rate limiting here without
-// touching providers or callers.
+// The concurrency slot is acquired inside the goroutine, so Submit does not
+// block; work canceled while queued returns ctx.Err() without running fn.
 func (t *throttle) dispatch(ctx context.Context, fn func(context.Context) (Result, error)) Future {
 	ch := make(chan result, 1)
 	go func() {
@@ -162,20 +156,20 @@ func (s *Set) Close() {
 // non-positive value leaves the corresponding provider unbounded.
 type Limits map[Name]int
 
-// Default per-provider concurrency caps. Copilot sessions are heavy and often
-// server-side rate limited; pwsh runs local processes and can tolerate a wider
-// fan-out. Copilot concurrency is calculated based on available system RAM
-// (approximately 256MB per session for conservative headroom).
+// DefaultPwshParallel is grouped with Copilot's session estimate for the built-in
+// concurrency defaults. Copilot's default is derived from one quarter of
+// physical RAM, assuming roughly 256 MiB per session, with a floor of one session.
 const (
-	DefaultPwshParallel    = 8
-	bytesPerCopilotSession = 256 * 1024 * 1024 // 256MB per session
+	// DefaultPwshParallel is the default concurrency cap for the PowerShell provider.
+	DefaultPwshParallel = 8
+	// bytesPerCopilotSession is the estimated memory footprint of one Copilot session.
+	bytesPerCopilotSession = 256 * 1024 * 1024 // 256 MiB per session
 )
 
 // DefaultCopilotParallel computes the default concurrency for copilot.invoke
-// based on available system RAM (approximately 256MB per session for
-// conservative headroom). It queries total physical system memory and divides
-// by bytesPerCopilotSession, with a floor of 1. getTotalSystemMemory applies a
-// shared undetermined-memory fallback over the per-OS probeTotalSystemMemory.
+// from total physical memory. It divides one quarter of detected RAM by
+// bytesPerCopilotSession and applies a floor of 1, so the floor can exceed that
+// fraction on very small or undetected-memory systems.
 func DefaultCopilotParallel() int {
 	totalMemory := getTotalSystemMemory()
 	concurrency := int(totalMemory / bytesPerCopilotSession / 4)
@@ -185,21 +179,15 @@ func DefaultCopilotParallel() int {
 	return concurrency
 }
 
-// providerSpec is the single source of truth for one built-in provider: its
-// name, default concurrency cap, and constructor wiring. Adding a provider or
-// changing its default is one catalog entry rather than edits scattered across
-// DefaultLimits and Default.
+// providerSpec describes one built-in provider: its name, default concurrency cap, and
+// constructor wiring.
 type providerSpec struct {
 	name         Name
 	defaultLimit int
 	build        func(limit int) Provider
 }
 
-// catalog enumerates the built-in providers wired by Default. It is the one
-// place that pairs each provider's name, default cap, and constructor. It is a
-// function rather than a package-level var so each call builds a fresh,
-// caller-owned slice with no shared mutable state, and so Copilot's RAM-derived
-// default cap is computed at call time rather than frozen at package init.
+// catalog enumerates the built-in providers wired by Default.
 func catalog() []providerSpec {
 	return []providerSpec{
 		{name: NamePwsh, defaultLimit: DefaultPwshParallel, build: func(limit int) Provider { return NewPwshProvider(limit) }},

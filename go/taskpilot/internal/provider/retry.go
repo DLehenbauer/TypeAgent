@@ -7,17 +7,9 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/retry"
 )
 
-// policyFromInput builds a retry.Policy from the common per-node knobs
-// (maxAttempts, initialBackoffSeconds, maxBackoffSeconds), falling back to def
-// for any knob that is absent. These are the same input fields the workflow
-// author sets on a node; the provider now owns how they drive transient-error
-// retry.
-//
-// A knob that is present but not a positive integer is a configuration error,
-// not something to paper over: policyFromInput returns an error rather than
-// silently reverting to the default. Likewise, a maxBackoffSeconds that lands
-// below the effective initialBackoff is rejected instead of being silently
-// clamped up to it.
+// policyFromInput builds a retry policy from the node's override map and a
+// default policy. Present overrides must be positive integers, and the effective
+// maxBackoffSeconds must be at least initialBackoffSeconds.
 func policyFromInput(input map[string]any, def retry.Policy) (retry.Policy, error) {
 	p := def
 	if v, ok, err := positiveOverride(input, copilotKeyMaxAttempts); err != nil {
@@ -43,8 +35,8 @@ func policyFromInput(input map[string]any, def retry.Policy) (retry.Policy, erro
 }
 
 // positiveOverride reads a per-node retry knob. It reports (0, false, nil) when
-// the key is absent (use the default), (v, true, nil) for a valid positive
-// integer, and an error when the key is present but not a positive integer.
+// the key is absent and returns an error when a present value is not a positive
+// integer.
 func positiveOverride(input map[string]any, key string) (int, bool, error) {
 	raw, present := input[key]
 	if !present {

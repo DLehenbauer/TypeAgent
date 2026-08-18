@@ -8,15 +8,8 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
-// structToSchema builds a JSON Schema (draft 2020-12) for t via jsonschema-go's
-// reflection-based inference. Exported fields become properties keyed by their
-// JSON name; fields not marked "omitempty"/"omitzero" become required, and
-// additional properties are disallowed, so the generated schema mirrors the Go
-// struct exactly. The result is returned as a map[string]any so builtin input
-// schemas flow through the model uniformly with document-authored schemas.
-//
-// It panics on failure: the argument is a compile-time-known builtin input
-// type, so a failure indicates a programming error, not runtime input.
+// structToSchema builds a draft-2020-12 JSON Schema for a builtin input type.
+// It panics on failure because builtin schemas are compile-time-known.
 func structToSchema(t reflect.Type) map[string]any {
 	s, err := jsonschema.ForType(t, nil)
 	if err != nil {
@@ -33,11 +26,8 @@ func structToSchema(t reflect.Type) map[string]any {
 	return m
 }
 
-// withMinimum sets `minimum` on the named property of a struct-derived schema,
-// pushing a lower-bound invariant to the schema boundary so validation rejects
-// out-of-range values before the executor runs. It panics if the property is
-// absent: the schema and property name are compile-time-known, so a mismatch is
-// a programming error rather than runtime input.
+// withMinimum sets minimum on a property in a struct-derived schema.
+// It panics if the generated schema does not contain the named property.
 func withMinimum(schema map[string]any, property string, min float64) map[string]any {
 	props, ok := schema["properties"].(map[string]any)
 	if !ok {

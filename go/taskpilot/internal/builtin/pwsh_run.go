@@ -54,16 +54,17 @@ type PwshRunInput struct {
 	MaxBackoffSeconds     int  `json:"maxBackoffSeconds,omitempty"`
 }
 
+// pwshTask implements the pwsh.run builtin task.
 type pwshTask struct{}
 
-// pwshRunTaskName is the registered name of the pwsh.run builtin. It is a
-// constant so the external-state policy table can reference it without an
-// initialization cycle through Spec().
+// pwshRunTaskName names the registered pwsh.run builtin so runtime cache policy
+// can reference it without depending on a spec initialization cycle.
 const pwshRunTaskName = "pwsh.run"
 
 // PwshRunsOnInput is the input key binding a lease to a pwsh.run node.
 const PwshRunsOnInput = "runsOn"
 
+// Spec returns the pwsh.run metadata exposed by the builtin registry.
 func (t *pwshTask) Spec() model.TaskSpec {
 	return model.TaskSpec{
 		Name:        pwshRunTaskName,
@@ -74,6 +75,7 @@ func (t *pwshTask) Spec() model.TaskSpec {
 	}
 }
 
+// Execute runs pwsh.run through the host provider or a lease-backed target.
 func (t *pwshTask) Execute(ctx context.Context, input map[string]any, taskCtx Context) (any, error) {
 	lease, onLease, err := optionalLeaseInput(input, PwshRunsOnInput, pwshRunTaskName)
 	if err != nil {
@@ -108,10 +110,8 @@ func (t *pwshTask) Execute(ctx context.Context, input map[string]any, taskCtx Co
 }
 
 // executeOnLease runs the script inside the leased execution context and emits
-// the successor lease.
-//
-// Only a checkpointing run advances the lease's state. A transient run threads
-// the lease through unchanged.
+// the successor lease. Only the checkpointing path advances state;
+// non-checkpointing runs carry the lease through unchanged.
 func (t *pwshTask) executeOnLease(ctx context.Context, lease model.Lease, input map[string]any, taskCtx Context) (any, error) {
 	if taskCtx.Services == nil || taskCtx.Services.Targets == nil {
 		return nil, fmt.Errorf("%s: execution targets are not configured", pwshRunTaskName)
@@ -127,9 +127,8 @@ func (t *pwshTask) executeOnLease(ctx context.Context, lease model.Lease, input 
 	}
 	req := target.RunRequest{ID: lease.ID, State: lease.State, Script: request}
 	if checkpoint {
-		// The node's own content-addressed identity is the durable name of the
-		// state this run establishes, so the provider can key its store by it and
-		// recognize the same state on a later run.
+		// Checkpointing names the durable successor state so the target can
+		// restore it later.
 		req.Checkpoint = taskCtx.NodeID
 	}
 	outcome, err := backend.Run(ctx, req)
@@ -149,13 +148,8 @@ func (t *pwshTask) executeOnLease(ctx context.Context, lease model.Lease, input 
 	return out, nil
 }
 
-// Retry classifies each run by its result. A malformed provider result (not the
-// expected result map, or one lacking a parseable exitCode) is rejected rather
-// than mistaken for success. Otherwise a zero exit is accepted; a listed
-// retryableExitCode (or a timeout when retryOnTimeout is set) schedules another
-// attempt; any other non-zero exit is a failure unless allowNonZeroExit makes it
-// an accepted result. Because a failure is surfaced as an error, failed runs are
-// never cached.
+// Retry returns the backoff and result-classification policy for pwsh.run
+// attempts.
 func (t *pwshTask) Retry(input map[string]any) (retry.Options, error) {
 	policy, err := pwshPolicy(input)
 	if err != nil {
@@ -182,6 +176,8 @@ func (t *pwshTask) Retry(input map[string]any) (retry.Options, error) {
 			if !ok {
 				return retry.Fail
 			}
+			// Retryable codes are treated as transient, while non-zero exits are accepted
+			// only when the task explicitly opts into them.
 			switch {
 			case code == 0:
 				return retry.Done
@@ -196,12 +192,8 @@ func (t *pwshTask) Retry(input map[string]any) (retry.Options, error) {
 	}, nil
 }
 
-// describePwshFailure summarizes a rejected pwsh result for the error message:
-// whether it timed out, which non-zero code it exited with, or that the provider
-// returned a malformed result (not the expected map, or one lacking a parseable
-// exitCode), plus a trimmed snippet of stderr (where scripts write the actual
-// reason). It is the seam that turns an opaque "result rejected" into an
-// actionable diagnostic.
+// describePwshFailure formats a rejected pwsh result with the timeout,
+// exit code, or malformed payload and trims stderr to the tail that matters.
 func describePwshFailure(out any) string {
 	m, ok := out.(map[string]any)
 	if !ok {
@@ -225,8 +217,7 @@ func describePwshFailure(out any) string {
 	return b.String()
 }
 
-// truncateTail keeps the last max bytes of s (scripts emit the operative error
-// last), prefixing an ellipsis when content was dropped.
+// truncateTail keeps the final bytes of stderr while avoiding huge diagnostics.
 func truncateTail(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -234,6 +225,7 @@ func truncateTail(s string, max int) string {
 	return "..." + s[len(s)-max:]
 }
 
+// pwshPolicy derives the effective retry backoff policy for pwsh.run.
 func pwshPolicy(input map[string]any) (retry.Policy, error) {
 	p := retry.DefaultPolicy()
 	if v, ok := intValue(input["maxAttempts"]); ok && v > 0 {

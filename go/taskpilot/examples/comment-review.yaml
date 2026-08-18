@@ -1,0 +1,159 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+kind: taskpilot
+version: 1
+entry: commentReview
+
+# Review every non-test Go source file matched by the pattern and update
+# comments in place. Review nodes fan out through taskpilot's normal forEach
+# concurrency; cap Copilot sessions with --copilot-parallel if needed.
+#
+# From the taskpilot module root:
+#
+#   tp verify examples/comment-review.yaml
+#   tp run examples/comment-review.yaml
+#
+# Narrow the review with a doublestar glob relative to --root:
+#
+#   tp run examples/comment-review.yaml --pattern "internal/provider/*.go"
+
+tasks:
+  commentReview:
+    inputSchema:
+      type: object
+      required: [root, pattern]
+      properties:
+        root: { type: string, default: "" }
+        pattern: { type: string, default: "**/*.go" }
+    outputSchema:
+      type: object
+      required: [reviews]
+      properties:
+        reviews:
+          type: array
+          items: { type: object }
+    graph:
+      nodes:
+        resolveRoot:
+          task: pwsh.run
+          inputs:
+            script: "$r = $args[0]; if ([string]::IsNullOrWhiteSpace($r)) { $d = (Get-Location).Path; while ($d -and -not (Test-Path (Join-Path $d 'go.mod'))) { $p = Split-Path $d -Parent; if ($p -eq $d) { $d = $null; break }; $d = $p }; if (-not $d) { throw 'root not provided and no go.mod found at or above the working directory' }; $r = $d }; [pscustomobject]@{ root = $r.Trim() } | ConvertTo-Json -Compress"
+            args:
+              - { $from: input, name: root }
+              - { $from: run, name: id }
+            dryRunStdout: '{"root":"."}'
+          outputSchema: { type: object }
+
+        discover:
+          task: file.glob
+          inputs:
+            root: { $from: node, node: resolveRoot, path: [result, root] }
+            pattern: { $from: input, name: pattern }
+          outputSchema:
+            type: array
+            items: { type: object }
+
+        stringifyFiles:
+          task: json.stringify
+          inputs:
+            value: { $from: node, node: discover }
+          outputSchema: { type: string }
+
+        excludeTests:
+          task: pwsh.run
+          inputs:
+            script: "$files = @($args[0] | ConvertFrom-Json); $source = @($files | Where-Object { $_.relPath -notmatch '(^|/)[^/]+_test\\.go$' }); ConvertTo-Json -InputObject $source -Depth 4 -Compress"
+            args:
+              - { $from: node, node: stringifyFiles }
+            dryRunStdout: '[]'
+          outputSchema:
+            type: object
+            required: [result]
+            properties:
+              result:
+                type: array
+                items: { type: object }
+
+        reviewFiles:
+          task: reviewFile
+          forEach:
+            items: { $from: node, node: excludeTests, path: [result] }
+          inputs:
+            root: { $from: node, node: resolveRoot, path: [result, root] }
+            file: { $from: item }
+      output:
+        reviews: { $from: node, node: reviewFiles }
+
+  reviewFile:
+    inputSchema: { type: object }
+    outputSchema:
+      type: object
+      required: [file, response, format]
+      properties:
+        file: { type: string }
+        response: {}
+        format: { type: object }
+    graph:
+      nodes:
+        content:
+          task: file.ref
+          inputs:
+            path: { $from: input, name: file, path: [path] }
+          outputSchema: { type: object }
+
+        renderPrompt:
+          task: template.expand
+          inputs:
+            template: |
+              Task: fix comments in the Go file {{file}}. Edit that file only.
+
+              Steps:
+              1. Read {{file}}.
+              2. Check existing declaration and block comments against the code; fix comments
+                 that are wrong, stale, or misleading.
+              3. Add short comments only where they explain exported identifiers, non-obvious
+                 declarations, or unclear control flow.
+              4. If a comment mentions callers, ordering, or side effects, verify that claim
+                 from the repository before keeping it.
+
+              Comment rules:
+              - Exported declaration comments start with the identifier name. Example:
+                "Foo resolves the command."
+              - Other declaration comments should usually start with the identifier name too;
+                omit them when the code is self-evident.
+              - Prefer one or two short sentences. Say why the code exists, not what each
+                line does.
+              - Skip trivial getters, setters, and self-evident one-liners.
+
+              Do not change code, names, or behavior. Do not edit other files.
+            vars:
+              file: { $from: input, name: file, path: [relPath] }
+          outputSchema: { type: string }
+
+        review:
+          task: copilot.invoke
+          inputs:
+            prompt: { $from: node, node: renderPrompt }
+            context:
+              source: { $from: node, node: content }
+            model: "mai-code-1.1-flash"
+            workingDirectory: { $from: input, name: root }
+            permissionMode: approveAll
+            sessionIdleTimeoutSeconds: 1800
+
+        format:
+          task: pwsh.run
+          dependsOn: [review]
+          inputs:
+            script: "& gofmt -w $args[0]; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; [pscustomobject]@{ formatted = $args[0] } | ConvertTo-Json -Compress"
+            args:
+              - { $from: input, name: file, path: [path] }
+            cwd: { $from: input, name: root }
+            cache: false
+            dryRunStdout: '{"formatted":"dry-run.go"}'
+          outputSchema: { type: object }
+      output:
+        file: { $from: input, name: file, path: [relPath] }
+        response: { $from: node, node: review }
+        format: { $from: node, node: format }

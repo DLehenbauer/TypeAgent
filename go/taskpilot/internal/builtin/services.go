@@ -11,6 +11,7 @@ type Services struct {
 	Targets   *target.Registry
 }
 
+// Close shuts down the provider and target registries for the builtin runtime.
 func (s *Services) Close() {
 	if s == nil {
 		return

@@ -21,6 +21,7 @@ func jsonProjectSpec() model.TaskSpec {
 	}
 }
 
+// projectJSON follows object keys from Value according to Path.
 func projectJSON(_ context.Context, input map[string]any, _ Context) (any, error) {
 	in, err := decodeInput[jsonProjectInput](input)
 	if err != nil {

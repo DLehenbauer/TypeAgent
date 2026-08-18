@@ -26,6 +26,7 @@ type ValidationError struct {
 	Errors []string
 }
 
+// Error formats the validation failures as a multi-line message.
 func (e *ValidationError) Error() string {
 	return "verification failed:\n" + strings.Join(e.Errors, "\n")
 }
@@ -80,6 +81,7 @@ func Document(doc *model.Document, reg model.Registry) (*VerifiedDocument, error
 	if len(doc.Tasks) == 0 {
 		r.err("tasks: at least one task is required")
 	}
+	// Validate constants before task graphs so schema errors are reported early.
 	for name, c := range doc.Constants {
 		if err := schema.Compile(c.Schema); err != nil {
 			r.err("constants.%s.schema: %v", name, err)
@@ -114,6 +116,7 @@ func Document(doc *model.Document, reg model.Registry) (*VerifiedDocument, error
 	return &VerifiedDocument{Doc: doc, Graphs: r.graphs}, nil
 }
 
+// validateGraph validates a task graph and returns its dependency order and edges.
 func validateGraph(r *collector, doc *model.Document, reg model.Registry, taskName string, g *model.Graph) GraphInfo {
 	info := GraphInfo{}
 	if g == nil {
@@ -194,6 +197,7 @@ func validateGraph(r *collector, doc *model.Document, reg model.Registry, taskNa
 	return info
 }
 
+// collectNodeRefs collects node references embedded in nested input values.
 func collectNodeRefs(v any) []string {
 	var refs []string
 	var walk func(any)
@@ -218,6 +222,8 @@ func collectNodeRefs(v any) []string {
 	return refs
 }
 
+// topo builds a topological ordering for the dependency graph and reports nodes
+// left after acyclic progress stops.
 func topo(deps map[string]map[string]bool) ([]string, []string) {
 	in := map[string]int{}
 	next := map[string][]string{}
@@ -263,6 +269,7 @@ func topo(deps map[string]map[string]bool) ([]string, []string) {
 	return order, nil
 }
 
+// validateTaskCallCycles detects recursive graph task calls after per-task validation.
 func validateTaskCallCycles(r *collector, doc *model.Document) {
 	graph := map[string]map[string]bool{}
 	for name, task := range doc.Tasks {
@@ -307,6 +314,8 @@ func validateTaskCallCycles(r *collector, doc *model.Document) {
 	}
 }
 
+// validateEngineConstraint ensures the running engine satisfies a documented
+// version constraint.
 func validateEngineConstraint(constraint string) error {
 	parts := strings.Fields(constraint)
 	if len(parts) == 0 {
@@ -354,6 +363,7 @@ var comparators = []struct {
 	{"=", func(cmp int) bool { return cmp == 0 }},
 }
 
+// splitComparator splits a version comparator into its operator and version.
 func splitComparator(part string) (string, string) {
 	for _, c := range comparators {
 		if strings.HasPrefix(part, c.op) {
@@ -363,6 +373,7 @@ func splitComparator(part string) (string, string) {
 	return "=", strings.TrimSpace(part)
 }
 
+// semver represents a semantic version with an optional prerelease suffix.
 type semver struct {
 	major int
 	minor int
@@ -370,6 +381,7 @@ type semver struct {
 	pre   []string
 }
 
+// parseSemver parses a semantic version string into the internal form.
 func parseSemver(raw string) (semver, error) {
 	v := strings.TrimSpace(raw)
 	v = strings.TrimPrefix(v, "v")
@@ -406,6 +418,7 @@ func parseSemver(raw string) (semver, error) {
 	return parsed, nil
 }
 
+// compareSemver compares two semantic versions using the taskpilot engine ordering.
 func compareSemver(a, b semver) int {
 	if a.major != b.major {
 		if a.major < b.major {
@@ -469,6 +482,7 @@ func compareSemver(a, b semver) int {
 	return 0
 }
 
+// err records a validation error that will be returned to the caller.
 func (r *collector) err(format string, args ...any) {
 	r.errors = append(r.errors, fmt.Sprintf(format, args...))
 }

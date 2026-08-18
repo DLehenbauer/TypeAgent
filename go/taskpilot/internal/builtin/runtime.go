@@ -11,10 +11,13 @@ import (
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/target"
 )
 
+// schemaRegistry stores builtin task specs by name.
 type schemaRegistry struct {
 	tasks map[string]model.TaskSpec
 }
 
+// SchemaRegistry returns the builtin registry used by the engine and CLI when
+// validating tasks.
 func SchemaRegistry() model.Registry {
 	reg := &schemaRegistry{tasks: map[string]model.TaskSpec{}}
 	for _, spec := range specs() {
@@ -27,11 +30,13 @@ func SchemaRegistry() model.Registry {
 	return reg
 }
 
+// Get returns the registered task spec for name when it exists.
 func (r *schemaRegistry) Get(name string) (model.TaskSpec, bool) {
 	spec, ok := r.tasks[name]
 	return spec, ok
 }
 
+// All returns every registered spec in name order.
 func (r *schemaRegistry) All() []model.TaskSpec {
 	out := make([]model.TaskSpec, 0, len(r.tasks))
 	for _, spec := range r.tasks {
@@ -41,6 +46,7 @@ func (r *schemaRegistry) All() []model.TaskSpec {
 	return out
 }
 
+// specs builds the builtin task spec list used by both registry constructors.
 func specs() []model.TaskSpec {
 	return []model.TaskSpec{
 		templateExpandSpec,
@@ -68,12 +74,14 @@ func specs() []model.TaskSpec {
 	}
 }
 
+// Runtime stores builtin executors and task implementations for a single process.
 type Runtime struct {
 	executors map[string]Executor
 	tasks     map[string]Task
 	services  *Services
 }
 
+// Context carries execution metadata and runtime services for a task.
 type Context struct {
 	RunID string
 	// NodeID is the content-addressed identity of the executing node. A
@@ -83,8 +91,10 @@ type Context struct {
 	Services *Services
 }
 
+// Executor runs a builtin task with the current context and input.
 type Executor func(context.Context, map[string]any, Context) (any, error)
 
+// RuntimeRegistry builds the default runtime used by the engine and tests.
 func RuntimeRegistry() *Runtime {
 	rt := &Runtime{executors: map[string]Executor{}, tasks: map[string]Task{}}
 	rt.Register(templateExpandSpec.Name, expandTemplate)
@@ -131,8 +141,8 @@ func (r *Runtime) RegisterTask(t Task) {
 	r.tasks[name] = t
 }
 
-// reserve panics when name is already registered in either registry, keeping
-// executor and task names globally unique and unambiguous at Execute time.
+// reserve guards against duplicate builtin names so execution remains
+// unambiguous.
 func (r *Runtime) reserve(name string) {
 	if _, ok := r.executors[name]; ok {
 		panic(fmt.Sprintf("builtin %q already registered as an executor", name))
@@ -145,7 +155,7 @@ func (r *Runtime) reserve(name string) {
 // SetServices injects the runtime integrations made available to tasks.
 func (r *Runtime) SetServices(s *Services) { r.services = s }
 
-// SetProviders is a test convenience for workflows that use no targets.
+// SetProviders installs providers, lazily creating Services when needed.
 func (r *Runtime) SetProviders(p *provider.Set) {
 	if r.services == nil {
 		r.services = &Services{}
@@ -153,8 +163,7 @@ func (r *Runtime) SetProviders(p *provider.Set) {
 	r.services.Providers = p
 }
 
-// SetTargets is a test convenience for workflows that use no ordinary
-// providers.
+// SetTargets installs a target registry, lazily creating Services when needed.
 func (r *Runtime) SetTargets(targets *target.Registry) {
 	if r.services == nil {
 		r.services = &Services{}
@@ -175,13 +184,14 @@ var externalDigesters = map[string]func(map[string]any) (string, error){
 	templateExpandSpec.Name:    templatePathDigest,
 }
 
-// CacheBehavior reports whether a node may be memoized and the optional digest
-// of external state that participates in identity.
+// CacheBehavior reports whether a node may be memoized and the external-state
+// digest that participates in node identity.
 func (r *Runtime) CacheBehavior(task string, input map[string]any) (memoize bool, digest string, err error) {
 	if spec, ok := r.taskSpec(task); ok && spec.AlwaysRun {
 		return false, "", nil
 	}
 	if task == pwshRunTaskName {
+		// Lease-bound runs operate on live target state and are always executed.
 		if _, bound := input[PwshRunsOnInput]; bound {
 			return false, "", nil
 		}
@@ -206,15 +216,16 @@ func (r *Runtime) CacheBehavior(task string, input map[string]any) (memoize bool
 	return true, digest, nil
 }
 
-// IdentityInputs removes operational task inputs that must not invalidate
+// IdentityInputs strips operational task inputs that must not invalidate
 // content-addressed target state.
 func (r *Runtime) IdentityInputs(task string, input map[string]any) map[string]any {
 	projected := model.ProjectLeaseIdentityMap(input)
 	if task == LeaseAcquireTaskName {
+		// The failure policy affects cleanup, not the durable target state.
 		delete(projected, LeaseKeepOnFailureInput)
 		if options, ok := projected[LeaseOptionsInput].(map[string]any); ok {
-			// Connection credentials and workspace mappings affect how a target
-			// is reached, not the durable machine/checkpoint state it represents.
+			// Connection details affect how a target is reached, not which state
+			// it represents.
 			delete(options, "guest")
 			delete(options, "workspace")
 		}
@@ -222,6 +233,7 @@ func (r *Runtime) IdentityInputs(task string, input map[string]any) map[string]a
 	return projected
 }
 
+// taskSpec looks up a spec, including builtins registered as bare executors.
 func (r *Runtime) taskSpec(name string) (model.TaskSpec, bool) {
 	if task, ok := r.tasks[name]; ok {
 		return task.Spec(), true
@@ -234,6 +246,8 @@ func (r *Runtime) taskSpec(name string) (model.TaskSpec, bool) {
 	return model.TaskSpec{}, false
 }
 
+// Execute runs a named task or executor; Task implementations use managed
+// retries.
 func (r *Runtime) Execute(ctx context.Context, name string, input map[string]any, taskCtx Context) (any, error) {
 	taskCtx.Services = r.services
 	if t, ok := r.tasks[name]; ok {

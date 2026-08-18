@@ -7,7 +7,7 @@ import (
 
 // NodeIdentity is the canonical input to NodeID: the task, its version, the
 // inputs it consumes, an optional digest of external state, and its
-// predecessors. Two nodes share a cache key iff their identities are equal.
+// predecessors. Equal identities produce equal node IDs.
 type NodeIdentity struct {
 	Task    string         `json:"task"`
 	Version string         `json:"version"`
@@ -19,11 +19,12 @@ type NodeIdentity struct {
 	Predecessors []string `json:"predecessors"`
 }
 
-// NodeID returns a stable cache key derived from identity. The engine
-// compatibility version is folded into the hash domain so that crossing a
-// compatibility boundary (see version.CompatKey) invalidates all cached node
-// outputs. It returns an error only if the identity cannot be canonically
-// hashed (e.g. unencodable inputs).
+// NodeID returns a stable node ID derived from the identity. Executable cache
+// entries are indexed by this ID, and aggregate nodes use it for predecessor
+// IDs. The compatibility version is folded into the hash domain so that crossing
+// a compatibility boundary (see version.CompatKey) invalidates cached node
+// outputs. It returns an error only if the identity cannot be canonically hashed
+// (e.g. unencodable inputs).
 func NodeID(identity NodeIdentity) (string, error) {
 	return canonical.Hash("taskpilot.node.v1;engine="+version.CompatKey(), identity)
 }

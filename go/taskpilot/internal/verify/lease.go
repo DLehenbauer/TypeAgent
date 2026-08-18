@@ -37,6 +37,7 @@ func validateLeases(r *collector, reg model.Registry, _ *model.Document, taskNam
 			}
 		}
 
+		// Repeated node bodies cannot own or split a linear lease.
 		if node.ForEach != nil {
 			for _, tf := range node.ForEach.RefTemplates() {
 				rejectWholeLeaseRefs(r, taskName, "forEach."+tf.Name, id, tf.Value, potentialEmitters)
@@ -96,6 +97,7 @@ func validateLeases(r *collector, reg model.Registry, _ *model.Document, taskNam
 	}
 }
 
+// potentialLeaseEmitters finds nodes that can emit or forward a lease.
 func potentialLeaseEmitters(reg model.Registry, g *model.Graph) map[string]bool {
 	out := map[string]bool{}
 	for id, node := range g.Nodes {
@@ -128,6 +130,7 @@ func potentialLeaseEmitters(reg model.Registry, g *model.Graph) map[string]bool 
 	return out
 }
 
+// rejectWholeLeaseRefs rejects whole-node references to lease-carrying nodes.
 func rejectWholeLeaseRefs(r *collector, taskName, field, nodeID string, value any, emitters map[string]bool) {
 	for _, producer := range wholeNodeRefsIn(value) {
 		if emitters[producer] {
@@ -136,6 +139,7 @@ func rejectWholeLeaseRefs(r *collector, taskName, field, nodeID string, value an
 	}
 }
 
+// loopLeaseTemplates returns loop fields that are checked for lease references.
 func loopLeaseTemplates(loop *model.LoopSpec) []model.TemplateField {
 	fields := loop.RefTemplates()
 	for _, tf := range fields {
@@ -146,7 +150,7 @@ func loopLeaseTemplates(loop *model.LoopSpec) []model.TemplateField {
 	return append(fields, model.TemplateField{Name: "state", Value: loop.State})
 }
 
-// leaseRefsIn returns the nodes whose lease output is explicitly selected.
+// leaseRefsIn collects node IDs whose lease output is explicitly selected.
 func leaseRefsIn(v any) []string {
 	var refs []string
 	seen := map[string]bool{}
@@ -174,6 +178,7 @@ func leaseRefsIn(v any) []string {
 	return refs
 }
 
+// wholeNodeRefsIn collects node IDs referenced without selecting a path.
 func wholeNodeRefsIn(v any) []string {
 	var refs []string
 	seen := map[string]bool{}
@@ -204,6 +209,7 @@ func wholeNodeRefsIn(v any) []string {
 	return refs
 }
 
+// selectsLease reports whether a path selects the lease output from a node.
 func selectsLease(path any) bool {
 	segs, ok := path.([]any)
 	if !ok || len(segs) == 0 {
@@ -213,6 +219,7 @@ func selectsLease(path any) bool {
 	return first == model.LeaseOutputKey
 }
 
+// sortedNodeIDs sorts node IDs for stable validation passes.
 func sortedNodeIDs(nodes map[string]model.Node) []string {
 	out := make([]string, 0, len(nodes))
 	for id := range nodes {
@@ -222,6 +229,7 @@ func sortedNodeIDs(nodes map[string]model.Node) []string {
 	return out
 }
 
+// sortedKeys sorts map keys for deterministic error ordering.
 func sortedKeys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for key := range m {
@@ -231,6 +239,7 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
+// joinQuoted formats slice entries as comma-separated quoted strings.
 func joinQuoted(items []string) string {
 	out := ""
 	for i, item := range items {

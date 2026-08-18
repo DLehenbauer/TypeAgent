@@ -97,6 +97,7 @@ func Setup(processors ...sdktrace.SpanProcessor) (*sdktrace.TracerProvider, func
 		resource.NewSchemaless(attribute.String("service.name", "taskpilot")),
 	)
 	if err != nil {
+		// Falls back to the SDK default resource when the merge fails.
 		res = resource.Default()
 	}
 	opts := []sdktrace.TracerProviderOption{sdktrace.WithResource(res)}
@@ -281,16 +282,20 @@ func (v *AttrValue) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// unmarshalSlice decodes the concrete slice variant from a JSON array while
+// keeping the value domain closed.
 func (v *AttrValue) unmarshalSlice(data []byte) error {
 	var raw []json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	if len(raw) == 0 {
+		// Empty arrays have no element from which to infer a slice type.
 		*v = StringSliceValue(nil)
 		return nil
 	}
 	first := bytes.TrimSpace(raw[0])
+	// Infers the slice element type from the first element so the decode stays closed.
 	switch first[0] {
 	case '"':
 		var s []string
@@ -370,6 +375,8 @@ func recordFromSpan(phase string, s sdktrace.ReadOnlySpan) SpanRecord {
 	return rec
 }
 
+// attrsToMap maps OpenTelemetry attributes to the compact JSON-safe telemetry
+// map used by the span serializer.
 func attrsToMap(kvs []attribute.KeyValue) map[string]AttrValue {
 	if len(kvs) == 0 {
 		return nil
