@@ -122,6 +122,11 @@ func validateGraph(r *collector, doc *model.Document, reg model.Registry, taskNa
 	if g == nil {
 		return info
 	}
+	for _, ref := range collectNodeRefs(g.Output) {
+		if _, ok := g.Nodes[ref]; !ok {
+			r.err("tasks.%s.graph.output: node ref %q not found", taskName, ref)
+		}
+	}
 	if len(g.Nodes) == 0 {
 		if g.Output == nil {
 			r.err("tasks.%s.graph.output: required when graph has no nodes", taskName)
@@ -198,27 +203,19 @@ func validateGraph(r *collector, doc *model.Document, reg model.Registry, taskNa
 }
 
 // collectNodeRefs collects node references embedded in nested input values.
+// It walks templates through model.WalkTemplateRefs so that verification and
+// the engine's dependency scheduling cannot disagree about which references a
+// document has.
 func collectNodeRefs(v any) []string {
 	var refs []string
-	var walk func(any)
-	walk = func(x any) {
-		switch t := x.(type) {
-		case map[string]any:
-			if from, _ := t["$from"].(string); from == "node" {
-				if n, _ := t["node"].(string); n != "" {
-					refs = append(refs, n)
-				}
-			}
-			for _, v := range t {
-				walk(v)
-			}
-		case []any:
-			for _, v := range t {
-				walk(v)
+	model.WalkTemplateRefs(v, func(obj map[string]any) bool {
+		if from, ok := model.TemplateRefSource(obj); ok && from == "node" {
+			if n, _ := obj["node"].(string); n != "" {
+				refs = append(refs, n)
 			}
 		}
-	}
-	walk(v)
+		return true
+	})
 	return refs
 }
 

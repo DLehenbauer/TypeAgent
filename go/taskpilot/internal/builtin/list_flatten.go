@@ -21,7 +21,7 @@ var listFlattenSpec = model.TaskSpec{
 }
 
 func flattenList(_ context.Context, input map[string]any, _ Context) (any, error) {
-	var out []any
+	out := make([]any, 0)
 	for _, item := range asSlice(input["list"]) {
 		out = append(out, asSlice(item)...)
 	}

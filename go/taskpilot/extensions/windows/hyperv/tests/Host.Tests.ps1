@@ -107,13 +107,18 @@ Describe 'Hyper-V checkpoint lifecycle' {
         Mock Get-VMSnapshot { [pscustomobject]@{ Name = $Name } } -ModuleName $moduleName
         Mock Restore-VMSnapshot {} -ModuleName $moduleName
         Mock Remove-VMSnapshot {} -ModuleName $moduleName
+        Mock Get-VMNetworkAdapter { [pscustomobject]@{ VMName = $VMName; SwitchName = 'OldSwitch' } } -ModuleName $moduleName
+        Mock Connect-VMNetworkAdapter {} -ModuleName $moduleName
         Mock Get-VM { [pscustomobject]@{ Name = $Name; State = 'Off' } } -ModuleName $moduleName
 
-        Restore-HyperVCheckpoint -VMName 'vm1' -Name 'ready' | Out-Null
+        Restore-HyperVCheckpoint -VMName 'vm1' -Name 'ready' -SwitchName 'Default Switch' | Out-Null
         $removed = Remove-HyperVCheckpoint -VMName 'vm1' -Name 'ready'
 
         $removed.Removed | Should -BeTrue
         Should -Invoke Restore-VMSnapshot -ModuleName $moduleName -Times 1 -Exactly
+        Should -Invoke Connect-VMNetworkAdapter -ModuleName $moduleName -Times 1 -Exactly -ParameterFilter {
+            $SwitchName -eq 'Default Switch'
+        }
         Should -Invoke Remove-VMSnapshot -ModuleName $moduleName -Times 1 -Exactly
     }
 }

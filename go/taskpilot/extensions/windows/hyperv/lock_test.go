@@ -25,7 +25,7 @@ func TestHyperVMLockIsTakenOverWhenOwnerProcessIsGone(t *testing.T) {
 
 	// Simulate the owner dying without releasing: the file stays, the process
 	// does not.
-	swapProcessAlive(t, func(int) bool { return false })
+	swapProcessMatches(t, func(int) bool { return false })
 
 	second, err := acquireHyperVMLock(stateDir, "vm-1")
 	if err != nil {
@@ -49,7 +49,7 @@ func TestHyperVMLockIsRefusedWhileOwnerProcessLives(t *testing.T) {
 		t.Fatal("first acquire did not take the lock")
 	}
 
-	swapProcessAlive(t, func(int) bool { return true })
+	swapProcessMatches(t, func(int) bool { return true })
 
 	second, err := acquireHyperVMLock(stateDir, "vm-1")
 	if err != nil {
@@ -73,7 +73,7 @@ func TestHyperVMLockWithUnreadableOwnerIsNotStolen(t *testing.T) {
 		t.Fatalf("corrupt lock: %v", err)
 	}
 
-	swapProcessAlive(t, func(int) bool { return false })
+	swapProcessMatches(t, func(int) bool { return false })
 
 	stale, err := hyperVMLockStale(path)
 	if err != nil {
@@ -84,14 +84,45 @@ func TestHyperVMLockWithUnreadableOwnerIsNotStolen(t *testing.T) {
 	}
 }
 
-// The real liveness probe has to agree with the process table for the obvious
+// The real identity probe has to agree with the process table for the obvious
 // cases, otherwise the tests above would only be exercising the stub.
-func TestProcessAliveMatchesRealProcesses(t *testing.T) {
-	if !processAlive(os.Getpid()) {
-		t.Fatal("processAlive reported the running test binary as dead")
+func TestProcessMatchesRealProcesses(t *testing.T) {
+	started, alive := processStartToken(os.Getpid())
+	if !alive {
+		t.Fatal("processStartToken reported the running test binary as dead")
 	}
-	if processAlive(-1) {
-		t.Fatal("processAlive reported an invalid pid as alive")
+	if started == 0 {
+		t.Fatal("processStartToken returned no identity for the running test binary")
+	}
+	if !processMatches(os.Getpid(), started) {
+		t.Fatal("processMatches rejected the running test binary's own token")
+	}
+	if processMatches(os.Getpid(), started+1) {
+		t.Fatal("processMatches accepted a foreign start token for a reused pid")
+	}
+	if processMatches(-1, started) {
+		t.Fatal("processMatches reported an invalid pid as alive")
+	}
+}
+
+// A lock file records the owner's start token so later acquirers can probe
+// whether that exact process incarnation is still alive. If the host will not
+// report our own start time we cannot write that token, and a tokenless lock
+// silently degrades to the age backstop for everyone else. Acquisition has to
+// fail loudly instead.
+func TestHyperVMLockAcquireFailsWithoutOwnerIdentity(t *testing.T) {
+	stateDir := t.TempDir()
+	swapProcessStart(t, func(int) (uint64, bool) { return 0, true })
+
+	lock, err := acquireHyperVMLock(stateDir, "vm-1")
+	if err == nil {
+		t.Fatal("acquire succeeded without an owner identity")
+	}
+	if lock.Held() {
+		t.Fatal("acquire reported a held lock alongside an error")
+	}
+	if _, statErr := os.Stat(hyperVMLockPath(stateDir, "vm-1")); !os.IsNotExist(statErr) {
+		t.Fatalf("a lock file was left behind: %v", statErr)
 	}
 }
 
@@ -103,9 +134,20 @@ func TestHyperVMLockPathStaysUnderStateDir(t *testing.T) {
 	}
 }
 
-func swapProcessAlive(t *testing.T, fn func(int) bool) {
+func swapProcessStart(t *testing.T, fn func(int) (uint64, bool)) {
 	t.Helper()
-	prev := hyperVProcessAlive
-	hyperVProcessAlive = fn
-	t.Cleanup(func() { hyperVProcessAlive = prev })
+	prevStart := hyperVProcessStart
+	hyperVProcessStart = fn
+	t.Cleanup(func() {
+		hyperVProcessStart = prevStart
+	})
+}
+
+func swapProcessMatches(t *testing.T, fn func(int) bool) {
+	t.Helper()
+	prevMatches := hyperVProcessMatches
+	hyperVProcessMatches = func(pid int, _ uint64) bool { return fn(pid) }
+	t.Cleanup(func() {
+		hyperVProcessMatches = prevMatches
+	})
 }

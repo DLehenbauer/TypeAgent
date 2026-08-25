@@ -36,21 +36,57 @@ const (
 	hyperVMLockMaxAge          = time.Hour
 )
 
-// Backend implements target.Backend for Hyper-V managed VMs.
-type Backend struct {
-	runner hyperVRunner
-	gate   *gate
+var errHyperVBackendClosed = errors.New("hyperv: backend is closed")
 
-	mu        sync.Mutex
-	instances map[string]*hyperVInstance
+// Backend implements target.Backend for Hyper-V managed VMs.
+// touch and cleanup are the metadata side of a lease. They are fields rather
+// than direct calls so tests can inject I/O failures at the exact points where
+// acquire has to roll back and release has to resume.
+type Backend struct {
+	runner  hyperVRunner
+	gate    *gate
+	touch   func(stateDir, id, baseline string) error
+	cleanup func(stateDir, id string) error
+
+	mu         sync.Mutex
+	instances  map[string]*hyperVInstance
+	closing    bool
+	closeDone  chan struct{}
+	operations sync.WaitGroup
+}
+
+func (h *Backend) beginInstanceOperation(id string) (*hyperVInstance, func(), error) {
+	h.mu.Lock()
+	inst := h.instances[id]
+	blocked := inst != nil && (inst.releasing || inst.vmRemoved)
+	h.mu.Unlock()
+	if inst == nil {
+		return nil, nil, fmt.Errorf("hyperv: VM %q is not acquired", id)
+	}
+	if blocked {
+		return nil, nil, fmt.Errorf("hyperv: VM %q is being released", id)
+	}
+
+	inst.operation.Lock()
+	h.mu.Lock()
+	valid := h.instances[id] == inst && !inst.releasing && !inst.vmRemoved
+	h.mu.Unlock()
+	if !valid {
+		inst.operation.Unlock()
+		return nil, nil, fmt.Errorf("hyperv: VM %q is being released", id)
+	}
+	return inst, inst.operation.Unlock, nil
 }
 
 type hyperVInstance struct {
+	operation         sync.Mutex
 	id                string
 	opts              hyperVOptions
 	lock              hyperVMLock
 	logicalState      string
 	materializedState string
+	releasing         bool
+	vmRemoved         bool
 }
 
 type hyperVOptions struct {
@@ -90,6 +126,7 @@ type hyperVAcquireResult struct {
 	ID                string `json:"id"`
 	BaselineState     string `json:"baselineState"`
 	MaterializedState string `json:"materializedState,omitempty"`
+	Reused            bool   `json:"reused,omitempty"`
 }
 
 type hyperVRunResult struct {
@@ -116,10 +153,18 @@ type psHyperVRunner struct {
 
 // NewBackend returns the real Hyper-V execution-context provider.
 func NewBackend(limit int) *Backend {
+	return newBackend(&psHyperVRunner{command: execRunner{}}, limit)
+}
+
+// newBackend wires a backend around a runner so production and tests share one
+// set of defaults for the metadata seams.
+func newBackend(runner hyperVRunner, limit int) *Backend {
 	return &Backend{
-		runner:    &psHyperVRunner{command: execRunner{}},
+		runner:    runner,
 		gate:      newGate(limit),
 		instances: map[string]*hyperVInstance{},
+		touch:     touchHyperVInstance,
+		cleanup:   removeHyperVMetadata,
 	}
 }
 
@@ -128,6 +173,11 @@ func (h *Backend) Kind() target.Kind { return Kind }
 
 // Acquire requests a lease for a Hyper-V VM and returns the instance metadata.
 func (h *Backend) Acquire(ctx context.Context, req target.AcquireRequest) (target.Instance, error) {
+	if err := h.beginOperation(); err != nil {
+		return target.Instance{}, err
+	}
+	defer h.operations.Done()
+
 	out, err := h.gate.run(ctx, func(ctx context.Context) (any, error) {
 		return h.acquire(ctx, req)
 	})
@@ -184,18 +234,38 @@ func (h *Backend) acquire(ctx context.Context, req target.AcquireRequest) (hyper
 		acquired.BaselineState = opts.BaselineState
 	}
 	if acquired.ID != opts.VMName {
-		_ = lock.Release()
-		lock, err = acquireHyperVMLock(stateDir, acquired.ID)
+		// The runner named a different VM than we locked, so the lease has to
+		// move. A lock conflict here means that name belongs to another
+		// taskpilot process, so we fail without rolling back: leaking a VM is
+		// recoverable by Sweep, deleting someone else's VM is not.
+		nextLock, err := acquireHyperVMLock(stateDir, acquired.ID)
 		if err != nil {
 			return hyperVAcquireResult{}, err
 		}
-		if !lock.Held() {
+		if !nextLock.Held() {
 			return hyperVAcquireResult{}, fmt.Errorf("hyperv: VM %q is already locked by another taskpilot process", acquired.ID)
 		}
+		// Past this point the VM is provably ours, so a failure rolls it back.
+		// A failed release of the old name leaves that lock file behind until
+		// this process exits; that is reported rather than swallowed, and it
+		// strands only a name we no longer use.
+		previousLock := lock
+		lock = nextLock
 		opts.VMName = acquired.ID
+		if err := previousLock.Release(); err != nil {
+			retained, rollbackErr := h.rollbackAcquire(opts, acquired, stateDir, lock, err)
+			if retained {
+				releaseOnError = false
+			}
+			return hyperVAcquireResult{}, rollbackErr
+		}
 	}
-	if err := touchHyperVInstance(stateDir, acquired.ID, acquired.BaselineState); err != nil {
-		return hyperVAcquireResult{}, err
+	if err := h.touch(stateDir, acquired.ID, acquired.BaselineState); err != nil {
+		retained, rollbackErr := h.rollbackAcquire(opts, acquired, stateDir, lock, err)
+		if retained {
+			releaseOnError = false
+		}
+		return hyperVAcquireResult{}, rollbackErr
 	}
 	h.mu.Lock()
 	h.instances[acquired.ID] = &hyperVInstance{
@@ -210,8 +280,45 @@ func (h *Backend) acquire(ctx context.Context, req target.AcquireRequest) (hyper
 	return acquired, nil
 }
 
+func (h *Backend) rollbackAcquire(opts hyperVOptions, acquired hyperVAcquireResult, stateDir string, lock hyperVMLock, cause error) (bool, error) {
+	if acquired.Reused {
+		return false, cause
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	opts.VMName = acquired.ID
+	opts.KeepOnFailure = false
+	if err := h.runner.RemoveVM(cleanupCtx, opts, acquired.ID); err != nil {
+		h.retainFailedAcquire(opts, acquired, lock, false)
+		return true, errors.Join(cause, fmt.Errorf("hyperv: rollback acquired VM %q: %w", acquired.ID, err))
+	}
+	if err := h.cleanup(stateDir, acquired.ID); err != nil {
+		h.retainFailedAcquire(opts, acquired, lock, true)
+		return true, errors.Join(cause, fmt.Errorf("hyperv: remove rollback metadata for VM %q: %w", acquired.ID, err))
+	}
+	return false, cause
+}
+
+func (h *Backend) retainFailedAcquire(opts hyperVOptions, acquired hyperVAcquireResult, lock hyperVMLock, vmRemoved bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.instances[acquired.ID] = &hyperVInstance{
+		id:                acquired.ID,
+		opts:              opts,
+		lock:              lock,
+		logicalState:      acquired.BaselineState,
+		materializedState: acquired.MaterializedState,
+		vmRemoved:         vmRemoved,
+	}
+}
+
 // Release drops the process-local lease and removes the VM when keep is false.
 func (h *Backend) Release(ctx context.Context, id string, keep bool) error {
+	if err := h.beginOperation(); err != nil {
+		return err
+	}
+	defer h.operations.Done()
+
 	_, err := h.gate.run(ctx, func(ctx context.Context) (any, error) {
 		return nil, h.release(ctx, id, keep)
 	})
@@ -220,26 +327,60 @@ func (h *Backend) Release(ctx context.Context, id string, keep bool) error {
 
 // release removes the local lease and deletes the VM unless the caller wants to keep it.
 func (h *Backend) release(ctx context.Context, id string, keep bool) error {
-	inst := h.takeInstance(id)
-	if inst == nil {
-		return nil
-	}
-	defer inst.lock.Release()
-	if keep {
-		return nil
-	}
-	if err := h.runner.RemoveVM(ctx, inst.opts, id); err != nil {
-		return err
-	}
-	stateDir, err := cache.ResolveStateDir()
+	inst, err := h.beginInstanceRelease(id)
 	if err != nil {
 		return err
 	}
-	return removeHyperVMetadata(stateDir, id)
+	if inst == nil {
+		return nil
+	}
+	defer inst.operation.Unlock()
+	committed := false
+	defer func() {
+		if !committed {
+			h.cancelInstanceRelease(id, inst)
+		}
+	}()
+	if keep && !inst.vmRemoved {
+		if err := inst.lock.Release(); err != nil {
+			return err
+		}
+		committed = h.takeInstanceIf(id, inst)
+		if !committed {
+			return fmt.Errorf("hyperv: VM %q ownership changed during release", id)
+		}
+		return nil
+	}
+	if !inst.vmRemoved {
+		if err := h.runner.RemoveVM(ctx, inst.opts, id); err != nil {
+			return err
+		}
+		h.markInstanceRemoved(id, inst)
+	}
+	stateDir, stateErr := cache.ResolveStateDir()
+	if stateErr != nil {
+		return stateErr
+	}
+	if err := h.cleanup(stateDir, id); err != nil {
+		return err
+	}
+	if err := inst.lock.Release(); err != nil {
+		return err
+	}
+	committed = h.takeInstanceIf(id, inst)
+	if !committed {
+		return fmt.Errorf("hyperv: VM %q ownership changed during release", id)
+	}
+	return nil
 }
 
 // Run executes a guest script and returns the decoded result for the request.
 func (h *Backend) Run(ctx context.Context, req target.RunRequest) (target.RunOutcome, error) {
+	if err := h.beginOperation(); err != nil {
+		return target.RunOutcome{}, err
+	}
+	defer h.operations.Done()
+
 	out, err := h.gate.run(ctx, func(ctx context.Context) (any, error) {
 		return h.exec(ctx, req)
 	})
@@ -258,10 +399,11 @@ func (h *Backend) exec(ctx context.Context, req target.RunRequest) (target.RunOu
 	if req.ID == "" {
 		return target.RunOutcome{}, fmt.Errorf("hyperv: run requires an id")
 	}
-	inst, err := h.requireInstance(req.ID)
+	inst, endOperation, err := h.beginInstanceOperation(req.ID)
 	if err != nil {
 		return target.RunOutcome{}, err
 	}
+	defer endOperation()
 	if err := inst.lock.Touch(); err != nil {
 		return target.RunOutcome{}, err
 	}
@@ -362,6 +504,11 @@ func hyperVWantsReboot(result script.Result) bool {
 
 // Sweep removes stale checkpoints and old VMs that have aged past the cutoff.
 func (h *Backend) Sweep(ctx context.Context, maxAge time.Duration) (int, error) {
+	if err := h.beginOperation(); err != nil {
+		return 0, err
+	}
+	defer h.operations.Done()
+
 	out, err := h.gate.run(ctx, func(ctx context.Context) (any, error) {
 		return h.sweep(ctx, maxAge)
 	})
@@ -442,44 +589,111 @@ func (h *Backend) sweep(ctx context.Context, maxAge time.Duration) (int, error) 
 	return removed, firstErr
 }
 
-// Close tears down all active instances and removes any VM that is not kept on failure.
+// Close waits for admitted operations, rejects new work, then tears down active instances.
 func (h *Backend) Close() {
+	h.mu.Lock()
+	if h.closing {
+		done := h.closeDone
+		h.mu.Unlock()
+		<-done
+		return
+	}
+	h.closing = true
+	h.closeDone = make(chan struct{})
+	done := h.closeDone
+	h.mu.Unlock()
+
+	h.operations.Wait()
+
 	h.mu.Lock()
 	instances := h.instances
 	h.instances = map[string]*hyperVInstance{}
 	h.mu.Unlock()
 	for _, inst := range instances {
-		if !inst.opts.KeepOnFailure {
+		if inst.vmRemoved {
+			if stateDir, stateErr := cache.ResolveStateDir(); stateErr == nil {
+				_ = h.cleanup(stateDir, inst.id)
+			}
+		} else if !inst.opts.KeepOnFailure {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			if err := h.runner.RemoveVM(ctx, inst.opts, inst.id); err == nil {
 				if stateDir, stateErr := cache.ResolveStateDir(); stateErr == nil {
-					_ = removeHyperVMetadata(stateDir, inst.id)
+					_ = h.cleanup(stateDir, inst.id)
 				}
 			}
 			cancel()
 		}
 		_ = inst.lock.Release()
 	}
+
+	close(done)
 }
 
-// requireInstance returns the active VM record or an error when it is not acquired.
-func (h *Backend) requireInstance(id string) (*hyperVInstance, error) {
+// beginOperation admits work that arrived before shutdown and rejects later calls.
+func (h *Backend) beginOperation() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closing {
+		return errHyperVBackendClosed
+	}
+	h.operations.Add(1)
+	return nil
+}
+
+// beginInstanceRelease marks an instance as releasing and takes its operation
+// lock, so an in-flight Run finishes before teardown starts and no new one
+// begins. It returns (nil, nil) when the VM was never acquired, which callers
+// treat as an already-released no-op. The caller owns inst.operation on success.
+func (h *Backend) beginInstanceRelease(id string) (*hyperVInstance, error) {
+	h.mu.Lock()
 	inst := h.instances[id]
-	if inst == nil {
-		return nil, fmt.Errorf("hyperv: VM %q is not acquired", id)
+	switch {
+	case inst == nil:
+		h.mu.Unlock()
+		return nil, nil
+	case inst.releasing:
+		h.mu.Unlock()
+		return nil, fmt.Errorf("hyperv: VM %q release is already in progress", id)
+	}
+	// Publish the intent before blocking so concurrent operations reject
+	// immediately instead of queueing behind the teardown.
+	inst.releasing = true
+	h.mu.Unlock()
+
+	inst.operation.Lock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.instances[id] != inst {
+		inst.operation.Unlock()
+		return nil, fmt.Errorf("hyperv: VM %q ownership changed during release", id)
 	}
 	return inst, nil
 }
 
-// takeInstance removes and returns an active VM record.
-func (h *Backend) takeInstance(id string) *hyperVInstance {
+func (h *Backend) cancelInstanceRelease(id string, expected *hyperVInstance) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	inst := h.instances[id]
+	if h.instances[id] == expected {
+		expected.releasing = false
+	}
+}
+
+func (h *Backend) markInstanceRemoved(id string, expected *hyperVInstance) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.instances[id] == expected {
+		expected.vmRemoved = true
+	}
+}
+
+func (h *Backend) takeInstanceIf(id string, expected *hyperVInstance) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.instances[id] != expected {
+		return false
+	}
 	delete(h.instances, id)
-	return inst
+	return true
 }
 
 // setLogicalState updates the logical checkpoint stored in the process-local instance map.
@@ -890,8 +1104,9 @@ type hyperVMLock struct {
 
 // hyperVMLockInfo stores the owner identity recorded in a VM lock file.
 type hyperVMLockInfo struct {
-	PID        int       `json:"pid"`
-	AcquiredAt time.Time `json:"acquiredAt"`
+	PID          int       `json:"pid"`
+	ProcessStart uint64    `json:"processStart,omitempty"`
+	AcquiredAt   time.Time `json:"acquiredAt"`
 }
 
 // Held reports whether acquisition was cached as successful.
@@ -902,24 +1117,23 @@ func (l hyperVMLock) Release() error {
 	if !l.held {
 		return nil
 	}
-	raw, err := os.ReadFile(l.path)
-	if errors.Is(err, os.ErrNotExist) {
+	return withHyperVMLockGuard(l.path, func() error {
+		raw, err := os.ReadFile(l.path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var current hyperVMLockInfo
+		if err := json.Unmarshal(raw, &current); err != nil || current != l.info {
+			return nil
+		}
+		if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 		return nil
-	}
-	if err != nil {
-		return err
-	}
-	var current hyperVMLockInfo
-	if err := json.Unmarshal(raw, &current); err != nil {
-		return nil
-	}
-	if current != l.info {
-		return nil
-	}
-	if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+	})
 }
 
 // Touch refreshes the lock mtime and verifies that the file still belongs to this process.
@@ -927,22 +1141,24 @@ func (l hyperVMLock) Touch() error {
 	if !l.held {
 		return nil
 	}
-	raw, err := os.ReadFile(l.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("hyperv: VM lock %q was lost", l.path)
-	}
-	if err != nil {
-		return err
-	}
-	var current hyperVMLockInfo
-	if err := json.Unmarshal(raw, &current); err != nil {
-		return fmt.Errorf("hyperv: VM lock %q is corrupt: %w", l.path, err)
-	}
-	if current != l.info {
-		return fmt.Errorf("hyperv: VM lock %q is owned by another taskpilot process", l.path)
-	}
-	now := time.Now()
-	return os.Chtimes(l.path, now, now)
+	return withHyperVMLockGuard(l.path, func() error {
+		now := time.Now()
+		raw, err := os.ReadFile(l.path)
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("hyperv: VM lock %q was lost", l.path)
+		}
+		if err != nil {
+			return err
+		}
+		var current hyperVMLockInfo
+		if err := json.Unmarshal(raw, &current); err != nil {
+			return fmt.Errorf("hyperv: VM lock %q is corrupt: %w", l.path, err)
+		}
+		if current != l.info {
+			return fmt.Errorf("hyperv: VM lock %q is owned by another taskpilot process", l.path)
+		}
+		return os.Chtimes(l.path, now, now)
+	})
 }
 
 // acquireHyperVMLock creates a lease file for the VM or returns an unheld lock when the existing lock cannot be taken.
@@ -952,40 +1168,51 @@ func acquireHyperVMLock(stateDir, id string) (hyperVMLock, error) {
 		return hyperVMLock{}, err
 	}
 	path := hyperVMLockPath(stateDir, id)
-	for {
-		info := hyperVMLockInfo{PID: os.Getpid(), AcquiredAt: time.Now().UTC()}
+	var acquired hyperVMLock
+	err := withHyperVMLockGuard(path, func() error {
+		stale, err := hyperVMLockStale(path)
+		if err != nil {
+			return err
+		}
+		if !stale {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		started, alive := hyperVProcessStart(os.Getpid())
+		if !alive || started == 0 {
+			// A lock that cannot name its owner is unprobeable: every later
+			// acquirer has to wait out the age backstop before it may touch this
+			// VM. Refuse to create one rather than silently downgrading the lease
+			// to a timeout.
+			return fmt.Errorf("hyperv: cannot establish owner identity for VM lock %q: the current process (pid %d) has no readable start time", path, os.Getpid())
+		}
+		info := hyperVMLockInfo{PID: os.Getpid(), ProcessStart: started, AcquiredAt: time.Now().UTC()}
 		raw, _ := json.MarshalIndent(info, "", "  ")
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o666)
-		if errors.Is(err, os.ErrExist) {
-			stale, err := hyperVMLockStale(path)
-			if err != nil {
-				return hyperVMLock{}, err
-			}
-			if stale {
-				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-					return hyperVMLock{}, err
-				}
-				continue
-			}
-			return hyperVMLock{}, nil
-		}
 		if err != nil {
-			return hyperVMLock{}, err
+			return err
 		}
 		if _, err := f.Write(raw); err != nil {
 			_ = f.Close()
 			_ = os.Remove(path)
-			return hyperVMLock{}, err
+			return err
 		}
 		if err := f.Close(); err != nil {
 			_ = os.Remove(path)
-			return hyperVMLock{}, err
+			return err
 		}
-		return hyperVMLock{path: path, info: info, held: true}, nil
+		acquired = hyperVMLock{path: path, info: info, held: true}
+		return nil
+	})
+	if err != nil {
+		return hyperVMLock{}, err
 	}
+	return acquired, nil
 }
 
-// hyperVMLockStale reports whether a missing, expired, or dead-owner lock can be taken over.
+// hyperVMLockStale reports whether a missing, dead-owner, or ownerless expired lock can be taken over.
 func hyperVMLockStale(path string) (bool, error) {
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -994,18 +1221,18 @@ func hyperVMLockStale(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if time.Since(info.ModTime()) > hyperVMLockMaxAge {
-		return true, nil
-	}
 	owner, err := readHyperVMLockInfo(path)
 	if err != nil {
-		// An unreadable lock is not proof the owner is gone; the age rule above is the backstop.
-		return false, nil
+		// Corrupt locks have no owner to probe, so age is their recovery backstop.
+		return time.Since(info.ModTime()) > hyperVMLockMaxAge, nil
 	}
-	if owner.PID <= 0 {
-		return false, nil
+	if owner.PID <= 0 || owner.ProcessStart == 0 {
+		// Acquisition refuses to write a lock without an owner identity, so an
+		// unidentifiable owner here came from a foreign or older writer. There is
+		// nothing to probe, which leaves age as the only safe recovery.
+		return time.Since(info.ModTime()) > hyperVMLockMaxAge, nil
 	}
-	return !hyperVProcessAlive(owner.PID), nil
+	return !hyperVProcessMatches(owner.PID, owner.ProcessStart), nil
 }
 
 // readHyperVMLockInfo loads the owner identity stored in a VM lease file.
@@ -1021,8 +1248,13 @@ func readHyperVMLockInfo(path string) (hyperVMLockInfo, error) {
 	return info, nil
 }
 
-// hyperVProcessAlive is a variable so tests can decide liveness without arranging for a real process.
-var hyperVProcessAlive = processAlive
+// hyperVProcessMatches is a variable so tests can decide lock ownership without
+// arranging for a real process with a known start time.
+var hyperVProcessMatches = processMatches
+
+// hyperVProcessStart is a variable so tests can simulate a host that will not
+// report the current process's creation time.
+var hyperVProcessStart = processStartToken
 
 // hyperVInstanceMeta stores the last-used timestamp and baseline state for a VM record.
 type hyperVInstanceMeta struct {
@@ -1074,7 +1306,7 @@ func touchHyperVCheckpoint(stateDir, id, state string, result ...script.Result) 
 // readHyperVCheckpointResult loads a checkpoint result and normalizes numbers for structured replay.
 func readHyperVCheckpointResult(stateDir, id, state string) (script.Result, bool) {
 	meta, err := readHyperVCheckpoint(hyperVCheckpointPath(stateDir, id, state))
-	if err != nil || meta.Result == nil {
+	if err != nil || meta.Result == nil || meta.ID != id || meta.State != state {
 		return script.Result{}, false
 	}
 	meta.Result.Value = normalizeHyperVCheckpointResult(meta.Result.Value)
@@ -1131,8 +1363,15 @@ func readHyperVCheckpoint(path string) (hyperVCheckpointMeta, error) {
 }
 
 func removeHyperVMetadata(stateDir, id string) error {
-	_ = os.Remove(filepath.Join(hyperVInstanceRoot(stateDir), safeFileName(id)+".json"))
-	return os.RemoveAll(filepath.Join(hyperVCheckpointRoot(stateDir), safeFileName(id)))
+	var errs []error
+	key := safeFileName(id)
+	if err := os.Remove(filepath.Join(hyperVInstanceRoot(stateDir), key+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, err)
+	}
+	if err := os.RemoveAll(filepath.Join(hyperVCheckpointRoot(stateDir), key)); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func hyperVMLockRoot(stateDir string) string {
@@ -1158,12 +1397,29 @@ func hyperVCheckpointPath(stateDir, id, state string) string {
 // safeFileName returns a stable metadata key, hashing names outside the narrow
 // character and length filter.
 func safeFileName(s string) string {
-	if s == "" {
-		return "_"
-	}
-	if clean := sanitizeHyperVName(s); clean == s && len(clean) < 80 {
+	const hashPrefix = "sha256-"
+	if clean := sanitizeHyperVName(s); s != "" && clean == s && len(clean) < 80 &&
+		!strings.HasPrefix(clean, hashPrefix) && !isWindowsReservedPathComponent(clean) {
 		return clean
 	}
 	sum := sha256.Sum256([]byte(s))
-	return base64.RawURLEncoding.EncodeToString(sum[:])
+	return hashPrefix + base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// isWindowsReservedPathComponent reports device names that Windows resolves
+// even when they have an extension or trailing dots/spaces.
+func isWindowsReservedPathComponent(s string) bool {
+	s = strings.TrimRight(s, ". ")
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		s = s[:i]
+	}
+	switch strings.ToUpper(s) {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	if len(s) == 4 {
+		prefix := strings.ToUpper(s[:3])
+		return (prefix == "COM" || prefix == "LPT") && s[3] >= '1' && s[3] <= '9'
+	}
+	return false
 }

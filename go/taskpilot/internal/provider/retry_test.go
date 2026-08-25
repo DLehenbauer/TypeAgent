@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -66,11 +67,26 @@ func TestPolicyFromInputRejectsInvalidOverrides(t *testing.T) {
 		{"fractional initialBackoff", map[string]any{copilotKeyInitialBackoffSeconds: 1.5}},
 		{"non-positive maxBackoff", map[string]any{copilotKeyMaxBackoffSeconds: 0}},
 	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := policyFromInput(tc.in, def); err == nil {
 				t.Fatalf("expected error for %v", tc.in)
 			}
 		})
+	}
+}
+
+func TestPolicyFromInputRejectsDurationOverflow(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("int cannot represent overflowing duration seconds")
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	tooLarge := int(maxDuration/time.Second) + 1
+	_, err := policyFromInput(map[string]any{
+		copilotKeyInitialBackoffSeconds: tooLarge,
+	}, retry.DefaultPolicy())
+	if err == nil {
+		t.Fatal("expected duration overflow error")
 	}
 }

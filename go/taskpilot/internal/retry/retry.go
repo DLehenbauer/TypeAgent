@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"math"
 	"math/big"
 	"time"
 )
@@ -171,18 +170,30 @@ func Run(ctx context.Context, opts Options, body func(context.Context) (any, err
 }
 
 // fibonacciBackoff returns the nth Fibonacci number × initialBackoff, capped at
-// maxBackoff.
+// maxBackoff. The series is computed iteratively rather than via Binet's
+// formula so a long attempt sequence cannot overflow before the cap applies.
 func fibonacciBackoff(attempt int, initialBackoff, maxBackoff time.Duration) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
-	phi := (1 + math.Sqrt(5)) / 2
-	fib := int64(math.Round(math.Pow(phi, float64(attempt)) / math.Sqrt(5)))
-	delay := time.Duration(fib) * initialBackoff
-	if delay > maxBackoff {
+	if initialBackoff <= 0 {
+		return 0
+	}
+	if initialBackoff >= maxBackoff {
 		return maxBackoff
 	}
-	return delay
+
+	// Stop multiplying as soon as the next term would exceed the cap, which
+	// keeps the accumulator bounded by maxBackoff/initialBackoff.
+	limit := int64(maxBackoff / initialBackoff)
+	previous, current := int64(1), int64(1)
+	for n := 3; n <= attempt; n++ {
+		if current > limit-previous {
+			return maxBackoff
+		}
+		previous, current = current, previous+current
+	}
+	return time.Duration(current) * initialBackoff
 }
 
 // fibonacciBackoffWithJitter applies downward jitter to fibonacciBackoff.

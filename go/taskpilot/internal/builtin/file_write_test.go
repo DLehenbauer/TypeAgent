@@ -40,30 +40,16 @@ func TestWriteFileRejectsEmptyPath(t *testing.T) {
 	}
 }
 
-func TestFileWriteCacheBehaviorObservesDestinationContent(t *testing.T) {
+func TestFileWriteIsNeverMemoized(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "out.txt")
 	rt := RuntimeRegistry()
 	input := map[string]any{"path": p, "content": "desired"}
 
-	memoize, missingDigest, err := rt.CacheBehavior(fileWriteSpec.Name, input)
+	memoize, digest, err := rt.CacheBehavior(fileWriteSpec.Name, input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !memoize {
-		t.Fatal("file.write must remain memoizable")
-	}
-
-	if err := os.WriteFile(p, []byte("stale"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	memoize, staleDigest, err := rt.CacheBehavior(fileWriteSpec.Name, input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !memoize {
-		t.Fatal("file.write must remain memoizable after the destination exists")
-	}
-	if missingDigest == staleDigest {
-		t.Fatalf("digest did not change after destination content changed: %q", staleDigest)
+	if memoize || digest != "" {
+		t.Fatalf("file.write cache behavior = (%v, %q), want non-cacheable", memoize, digest)
 	}
 }

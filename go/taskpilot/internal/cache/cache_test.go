@@ -2,6 +2,7 @@ package cache
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,11 +12,12 @@ import (
 func TestClaimReclaimsStaleClaim(t *testing.T) {
 	store := newTestStore(t)
 	path := store.claimPath("node")
-	if err := os.WriteFile(path, []byte(`{"runId":"old","startedAt":"old"}`), 0o666); err != nil {
+	old, err := store.Claim("node", "old")
+	if err != nil {
 		t.Fatal(err)
 	}
 	staleTime := time.Now().Add(-DefaultClaimMaxAge - time.Minute)
-	if err := os.Chtimes(path, staleTime, staleTime); err != nil {
+	if err := os.Chtimes(filepath.Join(path, old.info.Owner), staleTime, staleTime); err != nil {
 		t.Fatal(err)
 	}
 
@@ -76,13 +78,14 @@ func TestClaimReleaseDoesNotRemoveReclaimedClaim(t *testing.T) {
 		t.Fatal("initial claim was not acquired")
 	}
 	staleTime := time.Now().Add(-DefaultClaimMaxAge - time.Minute)
-	if err := os.Chtimes(path, staleTime, staleTime); err != nil {
+	if err := os.Chtimes(filepath.Join(path, first.info.Owner), staleTime, staleTime); err != nil {
 		t.Fatal(err)
 	}
 	second, err := store.Claim("node", "second")
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if !second.Held() {
 		t.Fatal("stale claim was not reclaimed")
 	}
@@ -97,6 +100,130 @@ func TestClaimReleaseDoesNotRemoveReclaimedClaim(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("claim still exists after new owner release: %v", err)
+	}
+}
+
+func TestClaimTouchPreventsReclaim(t *testing.T) {
+	store := newTestStore(t)
+	first, err := store.Claim("node", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := store.claimPath("node")
+	marker := filepath.Join(path, first.info.Owner)
+	// Just short of expiry: the heartbeat is what keeps a claim reclaimable only
+	// by its owner, so Touch has to refresh a marker that is nearly stale.
+	nearlyStale := time.Now().Add(-DefaultClaimMaxAge + time.Minute)
+	if err := os.Chtimes(marker, nearlyStale, nearlyStale); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Touch(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().After(nearlyStale) {
+		t.Fatalf("Touch did not refresh the marker: mtime = %s", info.ModTime())
+	}
+
+	second, err := store.Claim("node", "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Held() {
+		t.Fatal("old claim was stolen from a live owner")
+	}
+	if err := first.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestClaimTouchFailsAfterLeaseExpiry pins the fencing rule that lets stale
+// reclamation stay lock-free: once a marker ages out, its owner must not be
+// able to revive it, because a reclaimer reading the same mtime is already
+// entitled to remove it.
+func TestClaimTouchFailsAfterLeaseExpiry(t *testing.T) {
+	store := newTestStore(t)
+	claim, err := store.Claim("node", "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(store.claimPath("node"), claim.info.Owner)
+	expired := time.Now().Add(-DefaultClaimMaxAge - time.Minute)
+	if err := os.Chtimes(marker, expired, expired); err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Touch(); !errors.Is(err, ErrClaimLost) {
+		t.Fatalf("Touch after expiry = %v, want ErrClaimLost", err)
+	}
+	info, err := os.Stat(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().After(expired) {
+		t.Fatal("Touch refreshed a marker whose lease had already expired")
+	}
+}
+
+func TestSweepPreservesOldLiveClaim(t *testing.T) {
+	store := newTestStore(t)
+	claim, err := store.Claim("node", "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := store.claimPath("node")
+	old := time.Now().Add(-DefaultClaimMaxAge + time.Minute)
+	if err := os.Chtimes(filepath.Join(path, claim.info.Owner), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Touch(); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.Sweep(time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed = %d, want 0", removed)
+	}
+	assertClaimRunID(t, path, "owner")
+	if err := claim.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClaimReleaseDoesNotRemoveReplacementAtRemovalBoundary(t *testing.T) {
+	store := newTestStore(t)
+	path := store.claimPath("node")
+	first, err := store.Claim("node", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Held() {
+		t.Fatal("initial claim was not acquired")
+	}
+
+	var second Claim
+	var claimErr error
+	err = releaseClaimWithOwnerRemoved(path, first.info, func() {
+		second, claimErr = store.Claim("node", "second")
+	})
+	if err != nil {
+		t.Fatalf("release first claim: %v", err)
+	}
+	if claimErr != nil {
+		t.Fatalf("acquire replacement claim: %v", claimErr)
+	}
+	if !second.Held() {
+		t.Fatal("replacement claim was not acquired")
+	}
+	assertClaimRunID(t, path, "second")
+
+	if err := second.Release(); err != nil {
+		t.Fatalf("release replacement claim: %v", err)
 	}
 }
 
@@ -174,7 +301,14 @@ func entryRelPath(nodeID string, parts ...string) string {
 
 func assertClaimRunID(t *testing.T, path, want string) {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("claim owner entries = %d, want 1", len(entries))
+	}
+	raw, err := os.ReadFile(filepath.Join(path, entries[0].Name()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,5 +318,52 @@ func assertClaimRunID(t *testing.T, path, want string) {
 	}
 	if claim.RunID != want {
 		t.Fatalf("claim runID = %q, want %q", claim.RunID, want)
+	}
+}
+
+// Once the owner marker is gone the claim is relinquished, so leftover litter
+// must not be reported as a failure: the engine calls Release after the node's
+// output is already committed, and an error there would discard a successful
+// node and abort the run.
+func TestClaimReleaseIgnoresLeftoverClaimDirectory(t *testing.T) {
+	store := newTestStore(t)
+	path := store.claimPath("node")
+	claim, err := store.Claim("node", "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claim.Held() {
+		t.Fatal("claim was not acquired")
+	}
+
+	// Stand in for a directory that survives the owner's removal, which on
+	// Windows also happens transiently when a just-unlinked child is still
+	// delete-pending.
+	err = releaseClaimWithOwnerRemoved(path, claim.info, func() {
+		if writeErr := os.WriteFile(filepath.Join(path, "leftover"), []byte("x"), 0o666); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	})
+	if err != nil {
+		t.Fatalf("release reported a cleanup failure: %v", err)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("claim directory should have been left alone: %v", statErr)
+	}
+
+	// The leftover is self-healing: the next claimant reclaims it by age.
+	staleTime := time.Now().Add(-DefaultClaimMaxAge - time.Minute)
+	if err := os.Chtimes(filepath.Join(path, "leftover"), staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+	next, err := store.Claim("node", "next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !next.Held() {
+		t.Fatal("leftover claim directory was not reclaimed")
+	}
+	if err := next.Release(); err != nil {
+		t.Fatal(err)
 	}
 }

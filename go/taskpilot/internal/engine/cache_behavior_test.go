@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/builtin"
@@ -64,6 +66,76 @@ func TestHostPwshCacheFalseAlwaysExecutes(t *testing.T) {
 	calls, hits := runHostTwice(t, cacheDoc(false))
 	if calls != 2 || hits != 0 {
 		t.Fatalf("calls=%d hits=%d, want 2 and 0", calls, hits)
+	}
+}
+
+func TestNestedTaskDoesNotCacheOverNonCacheableChild(t *testing.T) {
+	doc := &model.Document{
+		Kind: model.DocumentKind, Version: model.DocumentVersion, Entry: "main",
+		Tasks: map[string]model.TaskDef{
+			"main": {
+				InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+				Graph: &model.Graph{
+					Nodes:  map[string]model.Node{"nested": {Task: "child", Inputs: map[string]any{}}},
+					Output: map[string]any{"result": map[string]any{"$from": "node", "node": "nested"}},
+				},
+			},
+			"child": {
+				InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+				Graph: &model.Graph{
+					Nodes: map[string]model.Node{"step": {
+						Task:         "pwsh.run",
+						Inputs:       map[string]any{"script": "Write-Output hi", "cache": false},
+						OutputSchema: map[string]any{"type": "object"},
+					}},
+					Output: map[string]any{"result": map[string]any{"$from": "node", "node": "step"}},
+				},
+			},
+		},
+	}
+
+	calls, hits := runHostTwice(t, doc)
+	if calls != 2 || hits != 0 {
+		t.Fatalf("calls=%d hits=%d, want 2 and 0", calls, hits)
+	}
+}
+
+func TestFileWriteRepairsExternallyRevertedContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "output.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	doc := &model.Document{
+		Kind: model.DocumentKind, Version: model.DocumentVersion, Entry: "main",
+		Tasks: map[string]model.TaskDef{"main": {
+			InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+			Graph: &model.Graph{
+				Nodes: map[string]model.Node{"write": {
+					Task: "file.write", Inputs: map[string]any{"path": path, "content": "desired"},
+				}},
+				Output: map[string]any{"path": map[string]any{"$from": "node", "node": "write"}},
+			},
+		}},
+	}
+	store := newTestStore(t, t.TempDir())
+	for _, runID := range []string{"first", "second"} {
+		if runID == "second" {
+			if err := os.WriteFile(path, []byte("before"), 0o666); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := New(doc, builtin.RuntimeRegistry(), store, nil).Run(context.Background(), Options{
+			RunID: runID, Input: map[string]any{}, MaxParallel: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "desired" {
+		t.Fatalf("content = %q, want desired", got)
 	}
 }
 

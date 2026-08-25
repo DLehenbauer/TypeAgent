@@ -3,8 +3,8 @@ package builtin
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -29,7 +29,7 @@ type FingerprintOutput struct {
 
 var sourceFingerprintSpec = model.TaskSpec{
 	Name:        "source.fingerprint",
-	Version:     "1",
+	Version:     "2",
 	InputSchema: structToSchema(reflect.TypeOf(FingerprintInput{})),
 }
 
@@ -55,13 +55,23 @@ func fingerprintSource(_ context.Context, input map[string]any, ctx Context) (an
 func fingerprint(path string) (string, error) {
 	h := sha256.New()
 	hashFile := func(path, name string) error {
-		fmt.Fprintf(h, "file:%s\n", filepath.ToSlash(name))
+		name = filepath.ToSlash(name)
+		if err := binary.Write(h, binary.BigEndian, uint64(len(name))); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(h, name); err != nil {
+			return err
+		}
 		f, err := os.Open(path)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		_, err = io.Copy(h, f)
+		content := sha256.New()
+		if _, err := io.Copy(content, f); err != nil {
+			return err
+		}
+		_, err = h.Write(content.Sum(nil))
 		return err
 	}
 	info, err := os.Stat(path)

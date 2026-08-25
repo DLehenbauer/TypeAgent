@@ -216,12 +216,20 @@ function Restore-HyperVCheckpoint {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$VMName,
-        [Parameter(Mandatory)][string]$Name
+        [Parameter(Mandatory)][string]$Name,
+        [string]$SwitchName
     )
 
     $snapshot = Get-HyperVCheckpoint -VMName $VMName -Name $Name
     if (-not $snapshot) { throw "Checkpoint '$Name' was not found on VM '$VMName'." }
     Restore-VMSnapshot -VMSnapshot $snapshot -Confirm:$false -ErrorAction Stop | Out-Null
+    if ($SwitchName) {
+        $adapter = Get-VMNetworkAdapter -VMName $VMName -ErrorAction Stop | Select-Object -First 1
+        if (-not $adapter) { throw "VM '$VMName' has no network adapter after restoring checkpoint '$Name'." }
+        if ($adapter.SwitchName -ne $SwitchName) {
+            Connect-VMNetworkAdapter -VMNetworkAdapter $adapter -SwitchName $SwitchName -ErrorAction Stop
+        }
+    }
     Get-VM -Name $VMName -ErrorAction Stop
 }
 

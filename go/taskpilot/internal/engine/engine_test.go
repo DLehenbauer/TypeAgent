@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,6 +51,69 @@ func TestRunTemplateWorkflow(t *testing.T) {
 	got := out.(map[string]any)["message"]
 	if got != "Hello, world!" {
 		t.Fatalf("message = %v", got)
+	}
+}
+
+func TestBuildDepsSkipsNodeRefsInsideLiteral(t *testing.T) {
+	graph := &model.Graph{
+		Nodes: map[string]model.Node{
+			"producer": {},
+			"literalOnly": {
+				Inputs: map[string]any{
+					"data": map[string]any{
+						"$literal": map[string]any{
+							"direct": map[string]any{"$from": "node", "node": "missing"},
+							"nested": []any{
+								map[string]any{"$from": "node", "node": "producer"},
+							},
+						},
+					},
+				},
+			},
+			"ordinary": {
+				Inputs: map[string]any{
+					"nested": []any{
+						map[string]any{"$from": "node", "node": "producer"},
+					},
+				},
+			},
+		},
+	}
+
+	deps := buildDeps(graph)
+	if got := deps["literalOnly"]; len(got) != 0 {
+		t.Fatalf("literalOnly dependencies = %v, want none", got)
+	}
+	if got := deps["ordinary"]; len(got) != 1 || got[0] != "producer" {
+		t.Fatalf("ordinary dependencies = %v, want [producer]", got)
+	}
+}
+
+// $literal short-circuits resolution, so every walker over templates has to
+// agree about it. A run-ID reference that is never resolved must not scope the
+// node to the run and disable its memoization.
+func TestTemplateUsesRunIDSkipsLiteral(t *testing.T) {
+	runRef := map[string]any{"$from": "run", "name": "id"}
+	if !templateUsesRunID(map[string]any{"id": runRef}) {
+		t.Fatal("resolved run-ID reference was not detected")
+	}
+	literal := map[string]any{"$literal": map[string]any{"id": runRef}}
+	if templateUsesRunID(map[string]any{"data": literal}) {
+		t.Fatal("run-ID reference under $literal was treated as resolved")
+	}
+	if templateUsesRunID([]any{literal}) {
+		t.Fatal("run-ID reference under a listed $literal was treated as resolved")
+	}
+	// Map iteration order is randomized, so a non-matching run reference beside
+	// a matching one must not decide the answer.
+	mixed := map[string]any{
+		"other": map[string]any{"$from": "run", "name": "notAnAlias"},
+		"id":    runRef,
+	}
+	for i := 0; i < 32; i++ {
+		if !templateUsesRunID(mixed) {
+			t.Fatal("run-ID reference was missed beside a non-matching run reference")
+		}
 	}
 }
 
@@ -837,5 +901,93 @@ func TestForEachConcurrencyValidAccepted(t *testing.T) {
 		MaxParallel: 4,
 	}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestForEachConcurrencyCannotExceedMaxParallel(t *testing.T) {
+	const items = 8
+	doc := forEachConcurrencyDoc(items, 0)
+	values := make([]any, items)
+	for i := range values {
+		values[i] = map[string]any{"script": "echo"}
+	}
+	node := doc.Tasks["main"].Graph.Nodes["fan"]
+	node.ForEach.Items = values
+	doc.Tasks["main"].Graph.Nodes["fan"] = node
+
+	recorder := &concurrencyRecorder{}
+	rt := builtin.RuntimeRegistry()
+	rt.SetProviders(provider.NewSet(&provider.FakeProvider{
+		ProviderName: provider.NamePwsh,
+		Limit:        items,
+		Respond:      recorder.respond,
+	}))
+	if _, err := New(doc, rt, newTestStore(t, t.TempDir()), nil).Run(context.Background(), Options{
+		RunID: "global-limit", Input: map[string]any{}, MaxParallel: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if peak := atomic.LoadInt32(&recorder.maxSeen); peak > 2 {
+		t.Fatalf("peak concurrency = %d, want <= 2", peak)
+	}
+}
+
+func TestSiblingForEachConcurrencySharesMaxParallel(t *testing.T) {
+	const items = 6
+	doc := forEachConcurrencyDoc(items, 0)
+	values := make([]any, items)
+	for i := range values {
+		values[i] = map[string]any{"script": "echo"}
+	}
+
+	first := doc.Tasks["main"].Graph.Nodes["fan"]
+	first.ForEach.Items = values
+	doc.Tasks["main"].Graph.Nodes["first"] = first
+	doc.Tasks["main"].Graph.Nodes["second"] = first
+	delete(doc.Tasks["main"].Graph.Nodes, "fan")
+	doc.Tasks["main"].Graph.Output = map[string]any{
+		"first":  map[string]any{"$from": "node", "node": "first"},
+		"second": map[string]any{"$from": "node", "node": "second"},
+	}
+
+	recorder := &concurrencyRecorder{}
+	rt := builtin.RuntimeRegistry()
+	rt.SetProviders(provider.NewSet(&provider.FakeProvider{
+		ProviderName: provider.NamePwsh,
+		Limit:        items * 2,
+		Respond:      recorder.respond,
+	}))
+	if _, err := New(doc, rt, newTestStore(t, t.TempDir()), nil).Run(context.Background(), Options{
+		RunID: "shared-global-limit", Input: map[string]any{}, MaxParallel: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if peak := atomic.LoadInt32(&recorder.maxSeen); peak > 2 {
+		t.Fatalf("aggregate peak concurrency = %d, want <= 2", peak)
+	}
+}
+
+func TestClaimHeartbeatCancelsNodeAfterOwnershipLoss(t *testing.T) {
+	store := newTestStore(t, t.TempDir())
+	claim, err := store.Claim("heartbeat-node", "run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	stop := keepClaimAlive(claim, time.Millisecond, cancel)
+	if err := claim.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-ctx.Done():
+		if !errors.Is(context.Cause(ctx), cache.ErrClaimLost) {
+			t.Fatalf("cancellation cause = %v, want ErrClaimLost", context.Cause(ctx))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat did not cancel after ownership loss")
+	}
+	if err := stop(); !errors.Is(err, cache.ErrClaimLost) {
+		t.Fatalf("heartbeat error = %v, want ErrClaimLost", err)
 	}
 }

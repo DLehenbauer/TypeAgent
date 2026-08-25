@@ -203,14 +203,17 @@ func TestKeepOnFailureDoesNotInvalidateLeaseStateNames(t *testing.T) {
 	}
 }
 
-func TestOperationalTargetOptionsDoNotInvalidateLeaseStateNames(t *testing.T) {
+func TestTargetIdentityIgnoresCredentialsButIncludesWorkspace(t *testing.T) {
 	store := newTestStore(t, t.TempDir())
 	firstDoc := devLoopDoc()
 	firstVM := firstDoc.Tasks["main"].Graph.Nodes["vm"]
 	firstVM.Inputs[builtin.LeaseOptionsInput] = map[string]any{
 		"baseImage": "base.vhdx",
 		"guest":     map[string]any{"username": "first", "passwordEnv": "FIRST_PASSWORD"},
-		"workspace": map[string]any{"uncPath": `\\host\first`},
+		"workspace": map[string]any{
+			"uncPath": `\\host\share`, "drive": "Z:", "username": "worker",
+			"passwordEnv": "FIRST_WORKSPACE_PASSWORD",
+		},
 	}
 	firstDoc.Tasks["main"].Graph.Nodes["vm"] = firstVM
 	first := &target.FakeBackend{}
@@ -221,7 +224,10 @@ func TestOperationalTargetOptionsDoNotInvalidateLeaseStateNames(t *testing.T) {
 	secondVM.Inputs[builtin.LeaseOptionsInput] = map[string]any{
 		"baseImage": "base.vhdx",
 		"guest":     map[string]any{"username": "second", "passwordEnv": "SECOND_PASSWORD"},
-		"workspace": map[string]any{"uncPath": `\\host\second`},
+		"workspace": map[string]any{
+			"uncPath": `\\host\share`, "drive": "Z:", "username": "worker",
+			"passwordEnv": "SECOND_WORKSPACE_PASSWORD",
+		},
 	}
 	secondDoc.Tasks["main"].Graph.Nodes["vm"] = secondVM
 	second := &target.FakeBackend{}
@@ -230,9 +236,35 @@ func TestOperationalTargetOptionsDoNotInvalidateLeaseStateNames(t *testing.T) {
 	firstRuns, secondRuns := first.Runs(), second.Runs()
 	for i := range firstRuns {
 		if firstRuns[i].Checkpoint != secondRuns[i].Checkpoint {
-			t.Fatalf("checkpoint changed with operational options: %q -> %q",
+			t.Fatalf("checkpoint changed with credential-only options: %q -> %q",
 				firstRuns[i].Checkpoint, secondRuns[i].Checkpoint)
 		}
+	}
+
+	thirdDoc := devLoopDoc()
+	thirdVM := thirdDoc.Tasks["main"].Graph.Nodes["vm"]
+	thirdVM.Inputs[builtin.LeaseOptionsInput] = map[string]any{
+		"baseImage": "base.vhdx",
+		"guest":     map[string]any{"username": "second", "passwordEnv": "SECOND_PASSWORD"},
+		"workspace": map[string]any{
+			"uncPath": `\\host\other`, "drive": "Y:", "username": "worker",
+			"passwordEnv": "SECOND_WORKSPACE_PASSWORD",
+		},
+	}
+	thirdDoc.Tasks["main"].Graph.Nodes["vm"] = thirdVM
+	third := &target.FakeBackend{}
+	runDevLoop(t, thirdDoc, third, store, "run-third")
+
+	thirdRuns := third.Runs()
+	changed := false
+	for i := range firstRuns {
+		if firstRuns[i].Checkpoint != thirdRuns[i].Checkpoint {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		t.Fatal("workspace location change did not invalidate checkpoint identity")
 	}
 }
 

@@ -34,6 +34,13 @@ func reduceList(_ context.Context, input map[string]any, _ Context) (any, error)
 		return nil, fmt.Errorf("unsupported reduce op %q", op)
 	}
 	acc := input["initial"]
+	if op == "" || op == "append" {
+		out := make([]any, 0, len(list)+1)
+		if acc != nil {
+			out = append(out, asSlice(acc)...)
+		}
+		return append(out, list...), nil
+	}
 	if acc == nil && len(list) > 0 {
 		acc = list[0]
 		list = list[1:]
@@ -52,8 +59,6 @@ func reduceList(_ context.Context, input map[string]any, _ Context) (any, error)
 				return nil, fmt.Errorf("sum reduce requires numeric items, got %T", item)
 			}
 			acc = a + n
-		case "", "append":
-			acc = append(asSlice(acc), item)
 		}
 	}
 	return acc, nil

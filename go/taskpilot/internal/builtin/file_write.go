@@ -20,6 +20,7 @@ var fileWriteSpec = model.TaskSpec{
 	Name:        "file.write",
 	Version:     "1",
 	InputSchema: structToSchema(reflect.TypeOf(fileWriteInput{})),
+	AlwaysRun:   true,
 }
 
 // writeFile writes content to path and returns the written path. Dry runs
@@ -39,13 +40,4 @@ func writeFile(_ context.Context, input map[string]any, ctx Context) (any, error
 		return nil, err
 	}
 	return in.Path, nil
-}
-
-// fileWriteDigest validates input and returns the current content digest for
-// input["path"].
-func fileWriteDigest(input map[string]any) (string, error) {
-	if asString(input["path"]) == "" {
-		return "", fmt.Errorf("file.write: path must not be empty")
-	}
-	return fileContentDigest(input)
 }

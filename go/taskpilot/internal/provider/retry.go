@@ -2,6 +2,7 @@ package provider
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/retry"
@@ -20,18 +21,34 @@ func policyFromInput(input map[string]any, def retry.Policy) (retry.Policy, erro
 	if v, ok, err := positiveOverride(input, copilotKeyInitialBackoffSeconds); err != nil {
 		return retry.Policy{}, err
 	} else if ok {
-		p.InitialBackoff = time.Duration(v) * time.Second
+		p.InitialBackoff, err = durationFromSeconds(v, copilotKeyInitialBackoffSeconds)
+		if err != nil {
+			return retry.Policy{}, err
+		}
 	}
 	if v, ok, err := positiveOverride(input, copilotKeyMaxBackoffSeconds); err != nil {
 		return retry.Policy{}, err
 	} else if ok {
-		p.MaxBackoff = time.Duration(v) * time.Second
+		p.MaxBackoff, err = durationFromSeconds(v, copilotKeyMaxBackoffSeconds)
+		if err != nil {
+			return retry.Policy{}, err
+		}
 	}
 	if p.MaxBackoff < p.InitialBackoff {
 		return retry.Policy{}, fmt.Errorf("retry override %q (%s) must be >= %q (%s)",
 			copilotKeyMaxBackoffSeconds, p.MaxBackoff, copilotKeyInitialBackoffSeconds, p.InitialBackoff)
 	}
 	return p, nil
+}
+
+// durationFromSeconds converts a positive second count from a node override,
+// rejecting values that time.Duration cannot represent instead of wrapping into
+// a negative delay.
+func durationFromSeconds(seconds int, key string) (time.Duration, error) {
+	if time.Duration(seconds) > math.MaxInt64/time.Second {
+		return 0, fmt.Errorf("override %q: %d seconds exceeds the supported duration", key, seconds)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 // positiveOverride reads a per-node retry knob. It reports (0, false, nil) when

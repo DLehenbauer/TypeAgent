@@ -53,12 +53,13 @@ func defaultCopilotPolicy() retry.Policy {
 // that the SDK types explicitly (e.g. ContextTier) reference the SDK types
 // directly so they cannot drift from the upstream definitions.
 type CopilotOptions struct {
-	Model                     string
-	ReasoningEffort           string
-	WorkingDirectory          string
-	PermissionMode            string
-	ContextTier               copilot.ContextTier
-	SessionIdleTimeoutSeconds int
+	Model            string
+	ReasoningEffort  string
+	WorkingDirectory string
+	PermissionMode   string
+	ContextTier      copilot.ContextTier
+	// SessionIdleTimeout bounds a single turn; zero leaves it unbounded.
+	SessionIdleTimeout time.Duration
 }
 
 // CopilotReply is the raw result of a single Copilot turn.
@@ -85,31 +86,53 @@ type CopilotClient interface {
 	Open(ctx context.Context, opts CopilotOptions) (CopilotSession, error)
 }
 
+// sdkRuntime is the subset of the Copilot SDK client used by sdkClient. Keeping
+// this lifecycle boundary small lets tests model a CLI process exit without
+// starting the real service.
+type sdkRuntime interface {
+	Start(context.Context) error
+	CreateSession(context.Context, *copilot.SessionConfig) (*copilot.Session, error)
+	Stop() error
+}
+
 // sdkClient tracks a shared Copilot SDK client and the lazily started CLI
 // process behind it.
 type sdkClient struct {
-	mu      sync.Mutex
-	client  *copilot.Client
-	started bool
+	mu        sync.Mutex
+	client    sdkRuntime
+	newClient func() sdkRuntime
 }
 
 // newSDKClient returns an SDK-backed client with no process running yet.
-func newSDKClient() *sdkClient { return &sdkClient{} }
+func newSDKClient() *sdkClient {
+	return &sdkClient{
+		newClient: func() sdkRuntime {
+			return copilot.NewClient(&copilot.ClientOptions{})
+		},
+	}
+}
 
-// ensureClient starts the shared CLI process once and returns the cached client.
-// A failed start leaves the client unstarted so a later Open can retry.
-func (c *sdkClient) ensureClient(ctx context.Context) (*copilot.Client, error) {
+// ensureClient asks the SDK to ensure that the shared CLI process is running
+// and returns the cached client. Start is intentionally called for every Open:
+// the SDK treats it as a no-op while connected and restarts its child after the
+// process-exit callback moves the client back to the disconnected state. A
+// failed start discards the client so a later Open gets a clean lifecycle.
+func (c *sdkClient) ensureClient(ctx context.Context) (sdkRuntime, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.started {
-		return c.client, nil
+
+	client := c.client
+	if client == nil {
+		client = c.newClient()
 	}
-	client := copilot.NewClient(&copilot.ClientOptions{})
 	if err := client.Start(ctx); err != nil {
+		c.client = nil
+		// Stop releases whatever the failed start left behind; a client that
+		// never connected treats it as a no-op.
+		_ = client.Stop()
 		return nil, err
 	}
 	c.client = client
-	c.started = true
 	return client, nil
 }
 
@@ -144,7 +167,7 @@ func (c *sdkClient) Open(ctx context.Context, opts CopilotOptions) (CopilotSessi
 	if err != nil {
 		return nil, err
 	}
-	return &sdkSession{session: session, idleTimeout: opts.SessionIdleTimeoutSeconds}, nil
+	return &sdkSession{session: session, idleTimeout: opts.SessionIdleTimeout}, nil
 }
 
 // Close stops the shared client and its CLI server process. It is safe to call
@@ -153,9 +176,8 @@ func (c *sdkClient) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.client != nil {
-		c.client.Stop()
+		_ = c.client.Stop()
 		c.client = nil
-		c.started = false
 	}
 }
 
@@ -163,7 +185,7 @@ func (c *sdkClient) Close() {
 // timeout to each send.
 type sdkSession struct {
 	session     *copilot.Session
-	idleTimeout int
+	idleTimeout time.Duration
 }
 
 // Send issues one prompt on the session and waits for the assistant reply, bounding
@@ -175,7 +197,7 @@ func (s *sdkSession) Send(ctx context.Context, prompt string) (CopilotReply, err
 	// Bound the wait so a stalled session cannot hold the call forever.
 	if s.idleTimeout > 0 {
 		var cancel context.CancelFunc
-		sendCtx, cancel = context.WithTimeout(ctx, time.Duration(s.idleTimeout)*time.Second)
+		sendCtx, cancel = context.WithTimeout(ctx, s.idleTimeout)
 		defer cancel()
 	}
 	reply, err := s.session.SendAndWait(sendCtx, copilot.MessageOptions{Prompt: prompt})
@@ -234,7 +256,7 @@ func (p *CopilotProvider) Close() {
 type copilotConfig struct {
 	Policy             retry.Policy
 	ValidationAttempts int
-	SessionIdleTimeout int
+	SessionIdleTimeout time.Duration
 }
 
 // parseCopilotConfig validates the per-invocation Copilot settings and returns
@@ -295,23 +317,24 @@ func (p *CopilotProvider) run(ctx context.Context, req Request) (Result, error) 
 		return nil, err
 	}
 	opts := CopilotOptions{
-		Model:                     asString(input[copilotKeyModel]),
-		ReasoningEffort:           asString(input[copilotKeyReasoningEffort]),
-		WorkingDirectory:          asString(input[copilotKeyWorkingDirectory]),
-		PermissionMode:            asString(input[copilotKeyPermissionMode]),
-		ContextTier:               tier,
-		SessionIdleTimeoutSeconds: cfg.SessionIdleTimeout,
+		Model:              asString(input[copilotKeyModel]),
+		ReasoningEffort:    asString(input[copilotKeyReasoningEffort]),
+		WorkingDirectory:   asString(input[copilotKeyWorkingDirectory]),
+		PermissionMode:     asString(input[copilotKeyPermissionMode]),
+		ContextTier:        tier,
+		SessionIdleTimeout: cfg.SessionIdleTimeout,
 	}
 
-	// One transient-retry configuration drives both session open and every
-	// turn so they replay the same way; divergence would observably change
-	// retry behavior between session open and turn.
-	retryOpts := retry.Options{
+	openRetryOpts := retry.Options{
 		Policy:  cfg.Policy,
 		OnError: func(err error, _ retry.Attempt) bool { return IsTransientCopilotError(err) },
 	}
+	turnRetryOpts := retry.Options{
+		Policy:  cfg.Policy,
+		OnError: func(err error, _ retry.Attempt) bool { return IsRetryableCopilotTurnError(err) },
+	}
 
-	session, err := p.openSession(ctx, opts, retryOpts)
+	session, err := p.openSession(ctx, opts, openRetryOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -333,11 +356,14 @@ func (p *CopilotProvider) run(ctx context.Context, req Request) (Result, error) 
 	turnPrompt := prompt
 	var lastErr error
 	for attempt := 1; attempt <= maxTurns; attempt++ {
-		reply, err := p.sendTurn(ctx, session, turnPrompt, retryOpts)
+		reply, err := p.sendTurn(ctx, session, turnPrompt, turnRetryOpts)
 		if err != nil {
 			return nil, err
 		}
 		if !reply.IsAssistant {
+			if wantStructured {
+				return nil, fmt.Errorf("copilot: structured output requires an assistant reply")
+			}
 			return reply.Content, nil
 		}
 		if !wantStructured {
@@ -456,19 +482,15 @@ func validationAttempts(input map[string]any) (int, error) {
 	return defaultValidationAttempts, nil
 }
 
-// sessionIdleTimeout returns the per-invocation session idle timeout in
-// seconds, or 0 when the node does not set sessionIdleTimeoutSeconds. A
-// present-but-illegal value is rejected rather than silently clamped to the
-// unbounded default.
-func sessionIdleTimeout(input map[string]any) (int, error) {
+// sessionIdleTimeout returns the per-invocation session idle timeout, or 0 when
+// the node does not set sessionIdleTimeoutSeconds. A present-but-illegal value
+// is rejected rather than silently clamped to the unbounded default.
+func sessionIdleTimeout(input map[string]any) (time.Duration, error) {
 	v, ok, err := positiveOverride(input, copilotKeySessionIdleTimeoutSeconds)
-	if err != nil {
+	if err != nil || !ok {
 		return 0, err
 	}
-	if ok {
-		return v, nil
-	}
-	return 0, nil
+	return durationFromSeconds(v, copilotKeySessionIdleTimeoutSeconds)
 }
 
 // extractJSON returns the JSON payload from a model reply, stripping a leading
@@ -529,6 +551,30 @@ func correctionPrompt(err error) string {
 		"explanation, commentary, or Markdown code fences.", err)
 }
 
+// copilotTimeoutFragments name failures where the request may already have been
+// delivered and acted on, so replaying them is not side-effect free.
+var copilotTimeoutFragments = []string{
+	"waiting for session.idle",
+	"context deadline exceeded",
+	"timeout",
+	"timed out",
+}
+
+// copilotTransportFragments name failures that were rejected or never reached
+// the service, so replaying them cannot duplicate work.
+var copilotTransportFragments = []string{
+	"rate limit",
+	"rate-limit",
+	"too many requests",
+	"429",
+	"temporarily unavailable",
+	"temporary",
+	"connection reset",
+	"connection refused",
+	"eof",
+	"broken pipe",
+}
+
 // IsTransientCopilotError reports whether err is a transient Copilot failure
 // that warrants a retry.
 func IsTransientCopilotError(err error) bool {
@@ -539,23 +585,26 @@ func IsTransientCopilotError(err error) bool {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
-	transientFragments := []string{
-		"waiting for session.idle",
-		"context deadline exceeded",
-		"timeout",
-		"timed out",
-		"rate limit",
-		"rate-limit",
-		"too many requests",
-		"429",
-		"temporarily unavailable",
-		"temporary",
-		"connection reset",
-		"connection refused",
-		"eof",
-		"broken pipe",
+	return containsAnyFragment(msg, copilotTimeoutFragments) ||
+		containsAnyFragment(msg, copilotTransportFragments)
+}
+
+// IsRetryableCopilotTurnError excludes deadlines and cancellation because a
+// timed-out turn may already have performed side effects and must not be sent
+// again. Session setup continues to use the broader transient classifier.
+func IsRetryableCopilotTurnError(err error) bool {
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
 	}
-	for _, fragment := range transientFragments {
+	msg := strings.ToLower(err.Error())
+	if containsAnyFragment(msg, copilotTimeoutFragments) {
+		return false
+	}
+	return containsAnyFragment(msg, copilotTransportFragments)
+}
+
+func containsAnyFragment(msg string, fragments []string) bool {
+	for _, fragment := range fragments {
 		if strings.Contains(msg, fragment) {
 			return true
 		}

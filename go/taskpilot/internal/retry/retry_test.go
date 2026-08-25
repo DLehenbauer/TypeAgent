@@ -1,25 +1,24 @@
-package retry_test
+package retry
 
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
-
-	"github.com/microsoft/TypeAgent/go/taskpilot/internal/retry"
 )
 
 // noBackoffPolicy returns a deterministic retry policy that never sleeps
 // between attempts, so Run-based tests exercise the attempt loop without
 // wall-clock delays. Centralizing it here keeps policy-shape changes to a
 // single edit site.
-func noBackoffPolicy(maxAttempts int) retry.Policy {
-	return retry.Policy{MaxAttempts: maxAttempts, InitialBackoff: 0, MaxBackoff: 0}
+func noBackoffPolicy(maxAttempts int) Policy {
+	return Policy{MaxAttempts: maxAttempts, InitialBackoff: 0, MaxBackoff: 0}
 }
 
 func TestRunSucceedsOnFirstAttempt(t *testing.T) {
 	calls := 0
-	out, err := retry.Run(context.Background(), retry.Options{Policy: retry.Policy{MaxAttempts: 3}},
+	out, err := Run(context.Background(), Options{Policy: Policy{MaxAttempts: 3}},
 		func(_ context.Context) (any, error) {
 			calls++
 			return "ok", nil
@@ -32,9 +31,9 @@ func TestRunSucceedsOnFirstAttempt(t *testing.T) {
 func TestRunRetriesTransientError(t *testing.T) {
 	transient := errors.New("transient")
 	calls := 0
-	_, err := retry.Run(context.Background(), retry.Options{
+	_, err := Run(context.Background(), Options{
 		Policy:  noBackoffPolicy(3),
-		OnError: func(e error, _ retry.Attempt) bool { return errors.Is(e, transient) },
+		OnError: func(e error, _ Attempt) bool { return errors.Is(e, transient) },
 	}, func(_ context.Context) (any, error) {
 		calls++
 		return nil, transient
@@ -47,9 +46,9 @@ func TestRunRetriesTransientError(t *testing.T) {
 func TestRunStopsOnNonRetryableError(t *testing.T) {
 	permanent := errors.New("permanent")
 	calls := 0
-	_, err := retry.Run(context.Background(), retry.Options{
+	_, err := Run(context.Background(), Options{
 		Policy:  noBackoffPolicy(5),
-		OnError: func(e error, _ retry.Attempt) bool { return false },
+		OnError: func(e error, _ Attempt) bool { return false },
 	}, func(_ context.Context) (any, error) {
 		calls++
 		return nil, permanent
@@ -61,13 +60,13 @@ func TestRunStopsOnNonRetryableError(t *testing.T) {
 
 func TestRunPollsUntilResultDone(t *testing.T) {
 	calls := 0
-	out, err := retry.Run(context.Background(), retry.Options{
+	out, err := Run(context.Background(), Options{
 		Policy: noBackoffPolicy(3),
-		OnResult: func(v any, _ retry.Attempt) retry.Verdict {
+		OnResult: func(v any, _ Attempt) Verdict {
 			if v.(int) < 3 {
-				return retry.Retry
+				return Retry
 			}
-			return retry.Done
+			return Done
 		},
 	}, func(_ context.Context) (any, error) {
 		calls++
@@ -80,9 +79,9 @@ func TestRunPollsUntilResultDone(t *testing.T) {
 
 func TestRunResultRetryExhaustedFails(t *testing.T) {
 	calls := 0
-	out, err := retry.Run(context.Background(), retry.Options{
+	out, err := Run(context.Background(), Options{
 		Policy:   noBackoffPolicy(2),
-		OnResult: func(any, retry.Attempt) retry.Verdict { return retry.Retry },
+		OnResult: func(any, Attempt) Verdict { return Retry },
 	}, func(_ context.Context) (any, error) {
 		calls++
 		return calls, nil
@@ -90,7 +89,7 @@ func TestRunResultRetryExhaustedFails(t *testing.T) {
 	if out != nil || calls != 2 {
 		t.Fatalf("calls=%d out=%v", calls, out)
 	}
-	var re *retry.ResultError
+	var re *ResultError
 	if !errors.As(err, &re) || !re.Exhausted {
 		t.Fatalf("err = %v, want exhausted ResultError", err)
 	}
@@ -101,14 +100,14 @@ func TestRunResultRetryExhaustedFails(t *testing.T) {
 
 func TestRunResultFailReturnsResultError(t *testing.T) {
 	calls := 0
-	_, err := retry.Run(context.Background(), retry.Options{
+	_, err := Run(context.Background(), Options{
 		Policy:   noBackoffPolicy(5),
-		OnResult: func(any, retry.Attempt) retry.Verdict { return retry.Fail },
+		OnResult: func(any, Attempt) Verdict { return Fail },
 	}, func(_ context.Context) (any, error) {
 		calls++
 		return "bad", nil
 	})
-	var re *retry.ResultError
+	var re *ResultError
 	if !errors.As(err, &re) || re.Exhausted || calls != 1 {
 		t.Fatalf("calls=%d err=%v", calls, err)
 	}
@@ -118,13 +117,13 @@ func TestRunResultFailReturnsResultError(t *testing.T) {
 }
 
 func TestRunResultFailDescribesResult(t *testing.T) {
-	_, err := retry.Run(context.Background(), retry.Options{
-		OnResult:       func(any, retry.Attempt) retry.Verdict { return retry.Fail },
+	_, err := Run(context.Background(), Options{
+		OnResult:       func(any, Attempt) Verdict { return Fail },
 		DescribeResult: func(r any) string { return "reason: " + r.(string) },
 	}, func(_ context.Context) (any, error) {
 		return "boom", nil
 	})
-	var re *retry.ResultError
+	var re *ResultError
 	if !errors.As(err, &re) {
 		t.Fatalf("err = %v, want ResultError", err)
 	}
@@ -141,9 +140,9 @@ func TestRunContextCancelledDuringSleep(t *testing.T) {
 	cancel() // pre-cancel so the first sleep returns immediately
 	transient := errors.New("transient")
 	calls := 0
-	_, err := retry.Run(ctx, retry.Options{
-		Policy:  retry.Policy{MaxAttempts: 5, InitialBackoff: time.Hour, MaxBackoff: time.Hour},
-		OnError: func(e error, _ retry.Attempt) bool { return errors.Is(e, transient) },
+	_, err := Run(ctx, Options{
+		Policy:  Policy{MaxAttempts: 5, InitialBackoff: time.Hour, MaxBackoff: time.Hour},
+		OnError: func(e error, _ Attempt) bool { return errors.Is(e, transient) },
 	}, func(_ context.Context) (any, error) {
 		calls++
 		return nil, transient
@@ -159,14 +158,31 @@ func TestRunContextCancelledDuringSleep(t *testing.T) {
 func TestRunDefaultPolicyNoRetry(t *testing.T) {
 	calls := 0
 	permanent := errors.New("permanent")
-	_, err := retry.Run(context.Background(), retry.Options{
-		Policy:  retry.DefaultPolicy(),
-		OnError: func(e error, _ retry.Attempt) bool { return true }, // even if retryable, MaxAttempts=1 means no retry
+	_, err := Run(context.Background(), Options{
+		Policy:  DefaultPolicy(),
+		OnError: func(e error, _ Attempt) bool { return true }, // even if retryable, MaxAttempts=1 means no retry
 	}, func(_ context.Context) (any, error) {
 		calls++
 		return nil, permanent
 	})
 	if err == nil || calls != 1 {
 		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
+func TestFibonacciBackoffCapsBeforeIntegerOverflow(t *testing.T) {
+	maximum := time.Duration(math.MaxInt64)
+	if got, want := fibonacciBackoff(92, time.Nanosecond, maximum), time.Duration(7540113804746346429); got != want {
+		t.Fatalf("attempt 92 backoff = %v, want %v", got, want)
+	}
+	if got := fibonacciBackoff(93, time.Nanosecond, maximum); got != maximum {
+		t.Fatalf("attempt 93 backoff = %v, want capped %v", got, maximum)
+	}
+}
+
+func TestFibonacciBackoffHugeAttemptIsCapped(t *testing.T) {
+	maximum := 10 * time.Second
+	if got := fibonacciBackoff(math.MaxInt, time.Second, maximum); got != maximum {
+		t.Fatalf("huge-attempt backoff = %v, want %v", got, maximum)
 	}
 }

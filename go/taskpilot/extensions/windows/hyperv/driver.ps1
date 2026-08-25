@@ -122,7 +122,7 @@ switch ($payload.action) {
         })
     }
     'restoreCheckpoint' {
-        Restore-HyperVCheckpoint -VMName $payload.id -Name $payload.state | Out-Null
+        Restore-HyperVCheckpoint -VMName $payload.id -Name $payload.state -SwitchName ([string]$opts.switchName) | Out-Null
         Write-Json ([ordered]@{ restored = $true })
     }
     'newCheckpoint' {

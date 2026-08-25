@@ -4,9 +4,176 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	copilot "github.com/github/copilot-sdk/go"
 )
+
+type fakeSDKRuntime struct {
+	mu            sync.Mutex
+	running       bool
+	startCalls    int
+	processStarts int
+	sessionCalls  int
+}
+
+func (f *fakeSDKRuntime) Start(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.startCalls++
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !f.running {
+		f.running = true
+		f.processStarts++
+	}
+	return nil
+}
+
+func (f *fakeSDKRuntime) CreateSession(ctx context.Context, _ *copilot.SessionConfig) (*copilot.Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !f.running {
+		return nil, errors.New("CLI process exited: EOF")
+	}
+	f.sessionCalls++
+	return nil, nil
+}
+
+func (f *fakeSDKRuntime) Stop() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.running = false
+	return nil
+}
+
+func (f *fakeSDKRuntime) crash() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.running = false
+}
+
+func (f *fakeSDKRuntime) counts() (startCalls, processStarts, sessionCalls int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.startCalls, f.processStarts, f.sessionCalls
+}
+
+func newFakeSDKClient(runtime sdkRuntime) *sdkClient {
+	return &sdkClient{newClient: func() sdkRuntime { return runtime }}
+}
+
+func TestSDKClientRestartsExitedProcess(t *testing.T) {
+	runtime := &fakeSDKRuntime{}
+	client := newFakeSDKClient(runtime)
+
+	first, err := client.Open(context.Background(), CopilotOptions{})
+	if err != nil {
+		t.Fatalf("first Open() error = %v", err)
+	}
+	first.Close()
+
+	runtime.crash()
+
+	second, err := client.Open(context.Background(), CopilotOptions{})
+	if err != nil {
+		t.Fatalf("Open() after crash error = %v", err)
+	}
+	second.Close()
+
+	startCalls, processStarts, sessionCalls := runtime.counts()
+	if startCalls != 2 {
+		t.Fatalf("Start calls = %d, want 2 (one lifecycle check per Open)", startCalls)
+	}
+	if processStarts != 2 {
+		t.Fatalf("process starts = %d, want 2 (initial start plus restart)", processStarts)
+	}
+	if sessionCalls != 2 {
+		t.Fatalf("session calls = %d, want 2", sessionCalls)
+	}
+}
+
+func TestSDKClientConcurrentOpenAfterCrashSharesRestart(t *testing.T) {
+	runtime := &fakeSDKRuntime{}
+	client := newFakeSDKClient(runtime)
+
+	session, err := client.Open(context.Background(), CopilotOptions{})
+	if err != nil {
+		t.Fatalf("initial Open() error = %v", err)
+	}
+	session.Close()
+	runtime.crash()
+
+	const opens = 8
+	errs := make(chan error, opens)
+	var wg sync.WaitGroup
+	for range opens {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			session, err := client.Open(context.Background(), CopilotOptions{})
+			if err == nil {
+				session.Close()
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Open() error = %v", err)
+		}
+	}
+
+	_, processStarts, sessionCalls := runtime.counts()
+	if processStarts != 2 {
+		t.Fatalf("process starts = %d, want 2 (one shared restart)", processStarts)
+	}
+	if sessionCalls != opens+1 {
+		t.Fatalf("session calls = %d, want %d", sessionCalls, opens+1)
+	}
+}
+
+func TestSDKClientCanceledRestartDoesNotPoisonLaterOpen(t *testing.T) {
+	runtime := &fakeSDKRuntime{}
+	client := newFakeSDKClient(runtime)
+
+	session, err := client.Open(context.Background(), CopilotOptions{})
+	if err != nil {
+		t.Fatalf("initial Open() error = %v", err)
+	}
+	session.Close()
+	runtime.crash()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.Open(ctx, CopilotOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Open() with canceled context error = %v, want context.Canceled", err)
+	}
+
+	session, err = client.Open(context.Background(), CopilotOptions{})
+	if err != nil {
+		t.Fatalf("Open() after canceled restart error = %v", err)
+	}
+	session.Close()
+
+	_, processStarts, sessionCalls := runtime.counts()
+	if processStarts != 2 {
+		t.Fatalf("process starts = %d, want 2", processStarts)
+	}
+	if sessionCalls != 2 {
+		t.Fatalf("session calls = %d, want 2", sessionCalls)
+	}
+}
 
 type fakeCopilotClient struct {
 	reply    CopilotReply
@@ -132,6 +299,22 @@ func TestCopilotProviderExpectJSONErrorsOnInvalid(t *testing.T) {
 	}
 }
 
+func TestCopilotProviderRejectsNonAssistantStructuredReply(t *testing.T) {
+	client := &fakeCopilotClient{reply: CopilotReply{Content: `{"answer":42}`}}
+	p := NewCopilotProvider(client, 0)
+
+	_, err := p.Submit(context.Background(), Request{Input: map[string]any{
+		copilotKeyPrompt:     "go",
+		copilotKeyExpectJSON: true,
+	}}).Await(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "requires an assistant reply") {
+		t.Fatalf("error = %v, want structured assistant-reply error", err)
+	}
+	if got := len(client.session.prompts); got != 1 {
+		t.Fatalf("send count = %d, want 1", got)
+	}
+}
+
 func TestCopilotProviderBuildsPromptWithContextAndSchema(t *testing.T) {
 	// The reply is a JSON string, satisfying the {"type":"string"} schema so the
 	// structured-validation path accepts it; this test only asserts on the
@@ -211,6 +394,24 @@ func TestCopilotProviderRetriesTransientErrors(t *testing.T) {
 	}
 	if client.calls != 2 {
 		t.Fatalf("calls = %d, want 2 (one retry)", client.calls)
+	}
+}
+
+func TestCopilotProviderDoesNotReplayTimedOutTurn(t *testing.T) {
+	client := &scriptedCopilotClient{fn: func(call int) (CopilotReply, error) {
+		return CopilotReply{}, context.DeadlineExceeded
+	}}
+	p := NewCopilotProvider(client, 0)
+
+	_, err := p.Submit(context.Background(), Request{Input: map[string]any{
+		copilotKeyPrompt:      "go",
+		copilotKeyMaxAttempts: 3,
+	}}).Await(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline exceeded", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("send count = %d, want 1", client.calls)
 	}
 }
 
@@ -346,7 +547,7 @@ func TestParseCopilotConfigDefaults(t *testing.T) {
 		t.Fatalf("validation attempts = %d, want default %d", cfg.ValidationAttempts, defaultValidationAttempts)
 	}
 	if cfg.SessionIdleTimeout != 0 {
-		t.Fatalf("idle timeout = %d, want 0 (unbounded)", cfg.SessionIdleTimeout)
+		t.Fatalf("idle timeout = %s, want 0 (unbounded)", cfg.SessionIdleTimeout)
 	}
 }
 
@@ -361,8 +562,8 @@ func TestParseCopilotConfigOverrides(t *testing.T) {
 	if cfg.ValidationAttempts != 4 {
 		t.Fatalf("validation attempts = %d, want 4", cfg.ValidationAttempts)
 	}
-	if cfg.SessionIdleTimeout != 30 {
-		t.Fatalf("idle timeout = %d, want 30", cfg.SessionIdleTimeout)
+	if cfg.SessionIdleTimeout != 30*time.Second {
+		t.Fatalf("idle timeout = %s, want 30s", cfg.SessionIdleTimeout)
 	}
 }
 
@@ -378,6 +579,7 @@ func TestParseCopilotConfigRejectsInvalidKnobs(t *testing.T) {
 		{"negative sessionIdleTimeoutSeconds", map[string]any{copilotKeySessionIdleTimeoutSeconds: -5}},
 		{"fractional sessionIdleTimeoutSeconds", map[string]any{copilotKeySessionIdleTimeoutSeconds: 1.5}},
 	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := parseCopilotConfig(tc.in); err == nil {
@@ -388,6 +590,19 @@ func TestParseCopilotConfigRejectsInvalidKnobs(t *testing.T) {
 				t.Fatalf("CopilotPolicy(%v) = nil error, want rejection", tc.in)
 			}
 		})
+	}
+}
+
+func TestParseCopilotConfigRejectsIdleTimeoutOverflow(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("int cannot represent overflowing duration seconds")
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	tooLarge := int(maxDuration/time.Second) + 1
+	if _, err := parseCopilotConfig(map[string]any{
+		copilotKeySessionIdleTimeoutSeconds: tooLarge,
+	}); err == nil {
+		t.Fatal("expected idle timeout overflow error")
 	}
 }
 

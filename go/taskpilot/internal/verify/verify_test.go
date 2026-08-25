@@ -3,6 +3,7 @@ package verify
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -39,6 +40,123 @@ func TestDocumentDetectsCycle(t *testing.T) {
 	}
 	if res != nil {
 		t.Fatalf("expected nil VerifiedDocument on failure, got %v", res)
+	}
+}
+
+func TestDocumentSkipsNodeRefsInsideLiteral(t *testing.T) {
+	doc := minimalValidDocument()
+	doc.Tasks["main"].Graph.Nodes = map[string]model.Node{
+		"producer": {
+			Task: "template.expand",
+		},
+		"literalOnly": {
+			Task: "template.expand",
+			Inputs: map[string]any{
+				"data": map[string]any{
+					"$literal": map[string]any{
+						"direct": map[string]any{"$from": "node", "node": "missing"},
+						"nested": []any{
+							map[string]any{"$from": "node", "node": "producer"},
+						},
+					},
+				},
+			},
+		},
+		"ordinary": {
+			Task: "template.expand",
+			Inputs: map[string]any{
+				"nested": []any{
+					map[string]any{"$from": "node", "node": "producer"},
+				},
+			},
+		},
+	}
+
+	verified, err := Document(doc, builtin.SchemaRegistry())
+	if err != nil {
+		t.Fatalf("expected literal-shaped reference data to verify, got %v", err)
+	}
+	wantEdges := []Edge{{From: "producer", To: "ordinary"}}
+	if got := verified.Graphs["main"].Edges; !reflect.DeepEqual(got, wantEdges) {
+		t.Fatalf("edges = %v, want %v", got, wantEdges)
+	}
+}
+
+// TestDocumentSkipsNodeRefsInsideReferenceObject pins the walker to resolver
+// semantics: resolveTemplate returns as soon as it sees a reference object and
+// reads only that object's own scalar fields, so a reference nested beneath one
+// is inert data. Descending into it would invent a dependency edge and reject a
+// document that resolves cleanly at runtime.
+func TestDocumentSkipsNodeRefsInsideReferenceObject(t *testing.T) {
+	doc := minimalValidDocument()
+	doc.Tasks["main"].Graph.Nodes = map[string]model.Node{
+		"producer": {
+			Task: "template.expand",
+		},
+		"consumer": {
+			Task: "template.expand",
+			Inputs: map[string]any{
+				"data": map[string]any{
+					"$from":   "node",
+					"node":    "producer",
+					"ignored": map[string]any{"$from": "node", "node": "missing"},
+				},
+			},
+		},
+	}
+
+	verified, err := Document(doc, builtin.SchemaRegistry())
+	if err != nil {
+		t.Fatalf("expected inert nested reference to verify, got %v", err)
+	}
+	wantEdges := []Edge{{From: "producer", To: "consumer"}}
+	if got := verified.Graphs["main"].Edges; !reflect.DeepEqual(got, wantEdges) {
+		t.Fatalf("edges = %v, want %v", got, wantEdges)
+	}
+}
+
+func TestDocumentValidatesGraphOutputReferences(t *testing.T) {
+	doc := minimalValidDocument()
+	doc.Tasks["main"].Graph.Output = map[string]any{
+		"value": map[string]any{"$from": "node", "node": "missing"},
+	}
+
+	_, err := Document(doc, builtin.SchemaRegistry())
+	if err == nil || !strings.Contains(err.Error(), `graph.output: node ref "missing" not found`) {
+		t.Fatalf("error = %v, want missing graph output reference", err)
+	}
+}
+
+func TestDocumentIncludesLoopControlNodeReferences(t *testing.T) {
+	doc := minimalValidDocument()
+	doc.Tasks["body"] = model.TaskDef{
+		InputSchema:  map[string]any{"type": "object"},
+		OutputSchema: map[string]any{"type": "object"},
+		Graph:        &model.Graph{Nodes: map[string]model.Node{}, Output: map[string]any{}},
+	}
+	doc.Tasks["main"].Graph.Nodes = map[string]model.Node{
+		"seed": {Task: "template.expand"},
+		"gate": {Task: "template.expand"},
+		"loop": {
+			Loop: &model.LoopSpec{
+				BodyTask:      "body",
+				MaxIterations: 1,
+				State: map[string]any{
+					"value": map[string]any{"$from": "node", "node": "seed"},
+				},
+				ContinueWhen: map[string]any{"$from": "node", "node": "gate"},
+			},
+		},
+	}
+	doc.Tasks["main"].Graph.Output = map[string]any{"value": map[string]any{"$from": "node", "node": "loop"}}
+
+	verified, err := Document(doc, builtin.SchemaRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Edge{{From: "gate", To: "loop"}, {From: "seed", To: "loop"}}
+	if got := verified.Graphs["main"].Edges; !reflect.DeepEqual(got, want) {
+		t.Fatalf("edges = %v, want %v", got, want)
 	}
 }
 

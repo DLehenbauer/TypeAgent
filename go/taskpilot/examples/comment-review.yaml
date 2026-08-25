@@ -148,7 +148,7 @@ tasks:
           inputs:
             script: "& gofmt -w $args[0]; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; [pscustomobject]@{ formatted = $args[0] } | ConvertTo-Json -Compress"
             args:
-              - { $from: input, name: file, path: [path] }
+              - { $from: input, name: file, path: [relPath] }
             cwd: { $from: input, name: root }
             cache: false
             dryRunStdout: '{"formatted":"dry-run.go"}'

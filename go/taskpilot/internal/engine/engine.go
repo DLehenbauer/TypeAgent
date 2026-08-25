@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -29,13 +30,18 @@ import (
 // Options configures a single Run. RunID labels the run for tracing and cache
 // keying; if empty, Run generates one via NewRunID. Input is the entry task's
 // input payload. DryRun skips side-effecting work and disables caching.
-// MaxParallel bounds concurrent node execution and must be at least 1; Run
-// rejects non-positive values.
+// MaxParallel bounds concurrently executing tasks across the whole run, not per
+// graph or per fan-out, and must be at least 1; Run rejects non-positive values.
 type Options struct {
 	RunID       string
 	Input       map[string]any
 	DryRun      bool
 	MaxParallel int
+
+	// limiter is the run-wide MaxParallel semaphore. Run installs it, and the
+	// same Options value is already threaded to every node, so the bound cannot
+	// be lost by a code path that forgets to propagate a context.
+	limiter chan struct{}
 }
 
 // Engine executes a parsed document's task graph against a runtime, reusing a
@@ -112,6 +118,7 @@ func (e *Engine) Run(ctx context.Context, opts Options) (any, error) {
 	if opts.RunID == "" {
 		opts.RunID = NewRunID()
 	}
+	opts.limiter = make(chan struct{}, opts.MaxParallel)
 	// Reset per-run cache counters so Stats() reflects only this run.
 	e.cacheHits.Store(0)
 	e.cacheMisses.Store(0)
@@ -153,8 +160,10 @@ func (e *Engine) runTask(ctx context.Context, taskName string, input map[string]
 	return out, nil
 }
 
-// runGraph evaluates a task graph in dependency waves, caps each ready wave
-// with MaxParallel, then resolves the graph output.
+// runGraph evaluates a task graph in dependency waves. The wave cap bounds how
+// many workers a single graph starts; the run-wide limiter established by Run
+// is what actually bounds executing tasks, since nested graphs and fan-outs
+// each start their own waves.
 func (e *Engine) runGraph(ctx context.Context, taskName string, graph *model.Graph, input map[string]any, opts Options) (any, error) {
 	if graph == nil {
 		return nil, fmt.Errorf("task %s has no graph", taskName)
@@ -367,6 +376,22 @@ func heldConcurrencySlots(ctx context.Context) []*slotHolder {
 	return slots
 }
 
+// acquireRunConcurrencySlot takes one token from the run-wide MaxParallel
+// limiter and returns a context carrying it as the innermost held slot, so a
+// later cache-claim wait parks it along with the graph and fan-out slots.
+func acquireRunConcurrencySlot(ctx context.Context, opts Options) (context.Context, func(), error) {
+	if opts.limiter == nil {
+		return ctx, nil, fmt.Errorf("run concurrency limiter is not installed; node execution must go through Run")
+	}
+	select {
+	case opts.limiter <- struct{}{}:
+	case <-ctx.Done():
+		return ctx, nil, ctx.Err()
+	}
+	holder := &slotHolder{sem: opts.limiter}
+	return withConcurrencySlot(ctx, holder), holder.release, nil
+}
+
 // runForEachNode resolves the item list, runs each item under the effective
 // fan-out limit, and returns an aggregate node ID and output.
 func (e *Engine) runForEachNode(ctx context.Context, id string, node model.Node, deps []string, scope *scopeState, opts Options) (out nodeResult, err error) {
@@ -407,7 +432,9 @@ func (e *Engine) runForEachNode(ctx context.Context, id string, node model.Node,
 		if n < 1 {
 			return nodeResult{}, fmt.Errorf("node %s forEach.maxConcurrency must be a positive integer, got %d", id, n)
 		}
-		limit = n
+		if n < limit {
+			limit = n
+		}
 	}
 	if node.MaxConcurrency < 0 {
 		return nodeResult{}, fmt.Errorf("node %s maxConcurrency must be a positive integer, got %d", id, node.MaxConcurrency)
@@ -555,7 +582,7 @@ func (e *Engine) runLoopNode(ctx context.Context, id string, node model.Node, de
 
 // runSingleNode resolves and validates inputs, computes the node identity, and
 // either serves cache or executes the task.
-func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, deps []string, scope *scopeState, opts Options) (nodeResult, error) {
+func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, deps []string, scope *scopeState, opts Options) (result nodeResult, retErr error) {
 	baseName, itemIndex, isItem := splitForEachID(id)
 	nodeAttrs := []attribute.KeyValue{
 		attribute.String(telemetry.AttrSpanKind, telemetry.SpanKindNode),
@@ -591,6 +618,16 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 		fail("input_validation", err)
 		return nodeResult{}, err
 	}
+	_, documentTask := e.doc.Tasks[node.Task]
+	if !documentTask {
+		var releaseSlot func()
+		ctx, releaseSlot, err = acquireRunConcurrencySlot(ctx, opts)
+		if err != nil {
+			fail("concurrency_slot", err)
+			return nodeResult{}, err
+		}
+		defer releaseSlot()
+	}
 	predecessors := predecessorIDs(deps, scope)
 	version := node.Version
 	if version == "" {
@@ -599,7 +636,11 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 	identityInputs := e.runtime.IdentityInputs(node.Task, input)
 	var externalDigest string
 	memoize := true
-	if !opts.DryRun {
+	if documentTask {
+		// Child nodes own their cache and external-state policies. Caching the
+		// containing graph here would bypass those policies on an outer hit.
+		memoize = false
+	} else if !opts.DryRun {
 		var derr error
 		memoize, externalDigest, derr = e.runtime.CacheBehavior(node.Task, input)
 		if derr != nil {
@@ -624,6 +665,33 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 	if memoize {
 		span.SetAttributes(attribute.String(telemetry.AttrCachePath, e.cache.EntryRef(nodeID).Path))
 	}
+	var claim cache.Claim
+	var stopClaimHeartbeat func() error
+	// Cleanup runs after the node has already reported success or failure, so
+	// anything it finds has to be re-stamped onto the span explicitly.
+	defer func() {
+		if stopClaimHeartbeat != nil {
+			if err := stopClaimHeartbeat(); err != nil {
+				// Losing the claim mid-execution means a peer may have run this
+				// node concurrently, so the result is not trustworthy.
+				err = fmt.Errorf("node %s claim heartbeat: %w", id, err)
+				if retErr == nil {
+					retErr = err
+					fail("claim_heartbeat", err)
+				} else {
+					span.RecordError(err)
+				}
+			}
+		}
+		if claim.Held() {
+			if err := claim.Release(); err != nil {
+				// Any output is already committed, so peers read it from the
+				// cache rather than waiting on this claim. Record the leaked
+				// claim instead of discarding a node that already finished.
+				span.RecordError(fmt.Errorf("node %s release claim: %w", id, err))
+			}
+		}
+	}()
 	if !opts.DryRun && memoize {
 		if cached, ok, err := e.cache.Read(nodeID); err != nil {
 			fail("cache_read", err)
@@ -641,7 +709,8 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 		}
 	}
 	if !opts.DryRun && memoize {
-		claim, cached, err := e.claimOrWaitForCache(ctx, span, id, nodeID, opts.RunID)
+		var cached *cache.Entry
+		claim, cached, err = e.claimOrWaitForCache(ctx, span, id, nodeID, opts.RunID)
 		if err != nil {
 			return nodeResult{}, err
 		}
@@ -658,15 +727,14 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 		}
 		// We hold the claim and will execute the node: a cacheable miss.
 		e.cacheMisses.Add(1)
-		defer func() {
-			if rerr := claim.Release(); rerr != nil {
-				span.RecordError(fmt.Errorf("node %s release claim: %w", id, rerr))
-			}
-		}()
+		nodeCtx, cancelNode := context.WithCancelCause(ctx)
+		ctx = nodeCtx
+		defer cancelNode(nil)
+		stopClaimHeartbeat = keepClaimAlive(claim, cache.DefaultClaimMaxAge/3, cancelNode)
 	}
 
 	var output any
-	if _, ok := e.doc.Tasks[node.Task]; ok {
+	if documentTask {
 		output, err = e.runTask(ctx, node.Task, input, opts)
 	} else {
 		output, err = e.runtime.Execute(ctx, node.Task, input, builtin.Context{RunID: opts.RunID, NodeID: nodeID, DryRun: opts.DryRun})
@@ -693,6 +761,14 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 		span.SetStatus(codes.Ok, "")
 		return nodeResult{NodeID: nodeID, Output: output}, nil
 	}
+	if stopClaimHeartbeat != nil {
+		if err := stopClaimHeartbeat(); err != nil {
+			stopClaimHeartbeat = nil
+			fail("claim_heartbeat", err)
+			return nodeResult{}, err
+		}
+		stopClaimHeartbeat = nil
+	}
 	entry := cache.Entry{NodeID: nodeID, Task: node.Task, Version: version, Predecessors: predecessors, CreatedAt: time.Now().UTC()}
 	if entry.Output, err = json.Marshal(output); err != nil {
 		fail("cache_encode", err)
@@ -708,6 +784,43 @@ func (e *Engine) runSingleNode(ctx context.Context, id string, node model.Node, 
 	span.SetAttributes(attribute.String(telemetry.AttrCacheStatus, telemetry.CacheStatusMiss))
 	span.SetStatus(codes.Ok, "")
 	return nodeResult{NodeID: nodeID, Output: output}, nil
+}
+
+func keepClaimAlive(claim cache.Claim, interval time.Duration, claimLost func(error)) func() error {
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		lastSuccess := time.Now()
+		for {
+			select {
+			case <-ticker.C:
+				if err := claim.Touch(); err != nil {
+					if errors.Is(err, cache.ErrClaimLost) || time.Since(lastSuccess) >= cache.DefaultClaimMaxAge/2 {
+						claimLost(err)
+						done <- err
+						return
+					}
+					continue
+				}
+				lastSuccess = time.Now()
+			case <-stop:
+				done <- nil
+				return
+			}
+		}
+	}()
+
+	var once sync.Once
+	var heartbeatErr error
+	return func() error {
+		once.Do(func() {
+			close(stop)
+			heartbeatErr = <-done
+		})
+		return heartbeatErr
+	}
 }
 
 // claimOrWaitForCache acquires the cache claim, possibly reclaiming a stale
@@ -872,25 +985,15 @@ func isRunIDAlias(name string) bool {
 
 // templateUsesRunID reports whether a template reads the run ID namespace.
 func templateUsesRunID(v any) bool {
-	switch t := v.(type) {
-	case map[string]any:
-		if from, _ := t["$from"].(string); from == "run" {
-			name, _ := t["name"].(string)
-			return isRunIDAlias(name)
+	found := false
+	model.WalkTemplateRefs(v, func(obj map[string]any) bool {
+		if from, ok := model.TemplateRefSource(obj); ok && from == "run" {
+			name, _ := obj["name"].(string)
+			found = found || isRunIDAlias(name)
 		}
-		for _, child := range t {
-			if templateUsesRunID(child) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range t {
-			if templateUsesRunID(child) {
-				return true
-			}
-		}
-	}
-	return false
+		return !found
+	})
+	return found
 }
 
 // taskVersion returns the effective version for a document task or builtin
@@ -997,10 +1100,10 @@ func resolveTemplate(template any, scope *scopeState) (any, error) {
 		}
 		return out, nil
 	case map[string]any:
-		if lit, ok := t["$literal"]; ok {
+		if lit, ok := t[model.TemplateLiteralKey]; ok {
 			return lit, nil
 		}
-		if from, ok := t["$from"].(string); ok {
+		if from, ok := model.TemplateRefSource(t); ok {
 			return resolveRef(from, t, scope)
 		}
 		out := map[string]any{}
@@ -1074,29 +1177,25 @@ func project(value any, segment string) (any, bool) {
 // collectRefs returns node references found anywhere in a template value.
 func collectRefs(v any) []string {
 	set := map[string]bool{}
-	var walk func(any)
-	walk = func(x any) {
-		switch t := x.(type) {
-		case map[string]any:
-			if from, _ := t["$from"].(string); from == "node" {
-				if n, _ := t["node"].(string); n != "" {
-					set[n] = true
-				}
-			}
-			for _, v := range t {
-				walk(v)
-			}
-		case []any:
-			for _, v := range t {
-				walk(v)
-			}
+	model.WalkTemplateRefs(v, func(obj map[string]any) bool {
+		if name, ok := nodeRefName(obj); ok {
+			set[name] = true
 		}
-	}
-	walk(v)
+		return true
+	})
 	var out []string
 	for n := range set {
 		out = append(out, n)
 	}
 	sort.Strings(out)
 	return out
+}
+
+// nodeRefName returns the node named by a `$from: node` reference object.
+func nodeRefName(obj map[string]any) (string, bool) {
+	if from, ok := model.TemplateRefSource(obj); !ok || from != "node" {
+		return "", false
+	}
+	name, _ := obj["node"].(string)
+	return name, name != ""
 }

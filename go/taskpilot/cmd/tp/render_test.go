@@ -22,7 +22,7 @@ func TestPrintLogEventRendersRunAndNodeSpans(t *testing.T) {
 			name: "run start",
 			rec: telemetry.SpanRecord{
 				Phase: telemetry.PhaseStart, Name: telemetry.SpanRun, StartTime: now,
-				Attributes: map[string]telemetry.AttrValue{telemetry.AttrRunID: telemetry.StringValue("run-x"), telemetry.AttrEntry: telemetry.StringValue("hello")},
+				Attributes: map[string]telemetry.AttrValue{telemetry.AttrSpanKind: telemetry.StringValue(telemetry.SpanKindRun), telemetry.AttrRunID: telemetry.StringValue("run-x"), telemetry.AttrEntry: telemetry.StringValue("hello")},
 			},
 			want: []string{"run started", "entry=hello", "run=run-x"},
 		},
@@ -30,7 +30,7 @@ func TestPrintLogEventRendersRunAndNodeSpans(t *testing.T) {
 			name: "run end ok",
 			rec: telemetry.SpanRecord{
 				Phase: telemetry.PhaseEnd, Name: telemetry.SpanRun, StartTime: now, EndTime: &end, Status: telemetry.StatusOK,
-				Attributes: map[string]telemetry.AttrValue{telemetry.AttrRunID: telemetry.StringValue("run-x")},
+				Attributes: map[string]telemetry.AttrValue{telemetry.AttrSpanKind: telemetry.StringValue(telemetry.SpanKindRun), telemetry.AttrRunID: telemetry.StringValue("run-x")},
 			},
 			want: []string{"run completed", "run=run-x"},
 		},
@@ -39,7 +39,7 @@ func TestPrintLogEventRendersRunAndNodeSpans(t *testing.T) {
 			rec: telemetry.SpanRecord{
 				Phase: telemetry.PhaseEnd, Name: telemetry.SpanRun, StartTime: now, EndTime: &end,
 				Status: telemetry.StatusError, StatusMsg: "kaboom",
-				Attributes: map[string]telemetry.AttrValue{telemetry.AttrRunID: telemetry.StringValue("run-x")},
+				Attributes: map[string]telemetry.AttrValue{telemetry.AttrSpanKind: telemetry.StringValue(telemetry.SpanKindRun), telemetry.AttrRunID: telemetry.StringValue("run-x")},
 			},
 			want: []string{"run failed", "error=kaboom"},
 		},
@@ -47,7 +47,7 @@ func TestPrintLogEventRendersRunAndNodeSpans(t *testing.T) {
 			name: "node start",
 			rec: telemetry.SpanRecord{
 				Phase: telemetry.PhaseStart, Name: telemetry.SpanNode, StartTime: now,
-				Attributes: map[string]telemetry.AttrValue{telemetry.AttrNodeName: telemetry.StringValue("render"), telemetry.AttrTask: telemetry.StringValue("template.expand"), telemetry.AttrNodeID: telemetry.StringValue("nid")},
+				Attributes: map[string]telemetry.AttrValue{telemetry.AttrSpanKind: telemetry.StringValue(telemetry.SpanKindNode), telemetry.AttrNodeName: telemetry.StringValue("render"), telemetry.AttrTask: telemetry.StringValue("template.expand"), telemetry.AttrNodeID: telemetry.StringValue("nid")},
 			},
 			want: []string{"node started", "render", "task=template.expand", "nodeId=nid"},
 		},
@@ -56,7 +56,7 @@ func TestPrintLogEventRendersRunAndNodeSpans(t *testing.T) {
 			rec: telemetry.SpanRecord{
 				Phase: telemetry.PhaseEnd, Name: telemetry.SpanNode, StartTime: now, EndTime: &end, Status: telemetry.StatusOK,
 				DurationMs: 5,
-				Attributes: map[string]telemetry.AttrValue{telemetry.AttrNodeName: telemetry.StringValue("render"), telemetry.AttrTask: telemetry.StringValue("template.expand"), telemetry.AttrNodeID: telemetry.StringValue("nid"), telemetry.AttrCacheStatus: telemetry.StringValue(telemetry.CacheStatusMiss)},
+				Attributes: map[string]telemetry.AttrValue{telemetry.AttrSpanKind: telemetry.StringValue(telemetry.SpanKindNode), telemetry.AttrNodeName: telemetry.StringValue("render"), telemetry.AttrTask: telemetry.StringValue("template.expand"), telemetry.AttrNodeID: telemetry.StringValue("nid"), telemetry.AttrCacheStatus: telemetry.StringValue(telemetry.CacheStatusMiss)},
 			},
 			want: []string{"node.completed", "render", "cache=miss", "durationMs=5"},
 		},
@@ -65,7 +65,7 @@ func TestPrintLogEventRendersRunAndNodeSpans(t *testing.T) {
 			rec: telemetry.SpanRecord{
 				Phase: telemetry.PhaseEnd, Name: telemetry.SpanNode, StartTime: now, EndTime: &end,
 				Status: telemetry.StatusError, StatusMsg: "bad input", DurationMs: 2,
-				Attributes: map[string]telemetry.AttrValue{telemetry.AttrNodeName: telemetry.StringValue("render"), telemetry.AttrTask: telemetry.StringValue("template.expand"), telemetry.AttrNodeID: telemetry.StringValue("nid"), telemetry.AttrStage: telemetry.StringValue("input_validation")},
+				Attributes: map[string]telemetry.AttrValue{telemetry.AttrSpanKind: telemetry.StringValue(telemetry.SpanKindNode), telemetry.AttrNodeName: telemetry.StringValue("render"), telemetry.AttrTask: telemetry.StringValue("template.expand"), telemetry.AttrNodeID: telemetry.StringValue("nid"), telemetry.AttrStage: telemetry.StringValue("input_validation")},
 			},
 			want: []string{"node failed", "stage=input_validation", "error=bad input"},
 		},

@@ -13,7 +13,7 @@ Describe 'Hyper-V driver actions with fake bundle modules' {
 function New-HyperVManagedVM { [pscustomobject]@{ Reused = $false } }
 function Test-HyperVCheckpoint { $false }
 function New-HyperVCheckpoint { [pscustomobject]@{ Name = $Name } }
-function Restore-HyperVCheckpoint {}
+function Restore-HyperVCheckpoint { param($VMName, $Name, $SwitchName) }
 function Remove-HyperVCheckpoint { param($VMName, $Name, [switch]$IgnoreMissing) }
 function Remove-HyperVManagedVM { param($VMName, $VmRoot, $VhdRoot) }
 Export-ModuleMember -Function *

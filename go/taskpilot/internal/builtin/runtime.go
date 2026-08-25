@@ -175,7 +175,6 @@ func (r *Runtime) SetTargets(targets *target.Registry) {
 // digests the external filesystem state its output depends on.
 var externalDigesters = map[string]func(map[string]any) (string, error){
 	fileReadJSONSpec.Name:      fileContentDigest,
-	fileWriteSpec.Name:         fileWriteDigest,
 	fileExistsSpec.Name:        fileExistsDigest,
 	fileGlobSpec().Name:        globDigest,
 	fileRefSpec.Name:           fileContentDigest,
@@ -216,6 +215,11 @@ func (r *Runtime) CacheBehavior(task string, input map[string]any) (memoize bool
 	return true, digest, nil
 }
 
+// workspaceIdentityFields are the workspace options that change what a guest
+// script can see. They are an allowlist rather than a credential denylist so a
+// new secret field cannot silently become part of a cache key.
+var workspaceIdentityFields = []string{"uncPath", "drive"}
+
 // IdentityInputs strips operational task inputs that must not invalidate
 // content-addressed target state.
 func (r *Runtime) IdentityInputs(task string, input map[string]any) map[string]any {
@@ -224,13 +228,27 @@ func (r *Runtime) IdentityInputs(task string, input map[string]any) map[string]a
 		// The failure policy affects cleanup, not the durable target state.
 		delete(projected, LeaseKeepOnFailureInput)
 		if options, ok := projected[LeaseOptionsInput].(map[string]any); ok {
-			// Connection details affect how a target is reached, not which state
-			// it represents.
+			// Guest settings affect only how the target is reached. Workspace
+			// location affects what scripts and checkpoints observe, so its
+			// location is kept while its credentials are not.
 			delete(options, "guest")
-			delete(options, "workspace")
+			if workspace, ok := options["workspace"].(map[string]any); ok {
+				options["workspace"] = retainFields(workspace, workspaceIdentityFields)
+			}
 		}
 	}
 	return projected
+}
+
+// retainFields returns the subset of m named by fields, omitting absent keys.
+func retainFields(m map[string]any, fields []string) map[string]any {
+	out := make(map[string]any, len(fields))
+	for _, field := range fields {
+		if value, ok := m[field]; ok {
+			out[field] = value
+		}
+	}
+	return out
 }
 
 // taskSpec looks up a spec, including builtins registered as bare executors.

@@ -75,3 +75,51 @@ func (t *stubTask) Execute(context.Context, map[string]any, Context) (any, error
 }
 
 func (t *stubTask) Retry(map[string]any) (retry.Options, error) { return retry.Options{}, nil }
+
+// Lease identity keeps a workspace allowlist rather than a credential
+// denylist, so a workspace field added later cannot silently enter the cache
+// key or leak a credential into it.
+func TestIdentityInputsKeepsOnlyWorkspaceLocation(t *testing.T) {
+	rt := RuntimeRegistry()
+	projected := rt.IdentityInputs(LeaseAcquireTaskName, map[string]any{
+		LeaseKeepOnFailureInput: true,
+		LeaseOptionsInput: map[string]any{
+			"baseImage": "base.vhdx",
+			"guest":     map[string]any{"username": "u", "passwordEnv": "P"},
+			"workspace": map[string]any{
+				"uncPath":     `\\host\share`,
+				"drive":       "Z:",
+				"username":    "worker",
+				"passwordEnv": "WORKSPACE_PASSWORD",
+				"apiToken":    "a-field-added-later",
+			},
+		},
+	})
+
+	if _, ok := projected[LeaseKeepOnFailureInput]; ok {
+		t.Fatal("keepOnFailure leaked into target identity")
+	}
+	options, ok := projected[LeaseOptionsInput].(map[string]any)
+	if !ok {
+		t.Fatalf("options = %#v, want an object", projected[LeaseOptionsInput])
+	}
+	if _, ok := options["guest"]; ok {
+		t.Fatal("guest connection settings leaked into target identity")
+	}
+	if options["baseImage"] != "base.vhdx" {
+		t.Fatalf("baseImage = %#v, want it preserved", options["baseImage"])
+	}
+	workspace, ok := options["workspace"].(map[string]any)
+	if !ok {
+		t.Fatalf("workspace = %#v, want an object", options["workspace"])
+	}
+	want := map[string]any{"uncPath": `\\host\share`, "drive": "Z:"}
+	if len(workspace) != len(want) {
+		t.Fatalf("workspace identity = %#v, want %#v", workspace, want)
+	}
+	for key, value := range want {
+		if workspace[key] != value {
+			t.Fatalf("workspace[%q] = %#v, want %#v", key, workspace[key], value)
+		}
+	}
+}

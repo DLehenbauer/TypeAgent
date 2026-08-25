@@ -139,12 +139,14 @@ type TemplateField struct {
 }
 
 // RefTemplates returns the LoopSpec fields walked for `$from: node` references.
-// State and ContinueWhen are loop-local controls and are excluded from both
-// dependency and run-ID analyses.
+// References to loop-local state and body values are ignored by the node-ref
+// walker, while references to graph nodes still participate in scheduling.
 func (l *LoopSpec) RefTemplates() []TemplateField {
 	return []TemplateField{
+		{Name: "state", Value: l.State},
 		{Name: "inputs", Value: l.Inputs},
 		{Name: "maxIterations", Value: l.MaxIterations},
+		{Name: "continueWhen", Value: l.ContinueWhen},
 	}
 }
 

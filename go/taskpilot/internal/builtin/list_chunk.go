@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 
 	"github.com/microsoft/TypeAgent/go/taskpilot/internal/model"
@@ -25,8 +26,11 @@ var listChunkSpec = model.TaskSpec{
 
 func chunkList(_ context.Context, input map[string]any, _ Context) (any, error) {
 	list := asSlice(input["list"])
-	size, _ := intValue(input["size"])
-	var chunks []any
+	size, ok := intValue(input["size"])
+	if !ok || size < 1 {
+		return nil, fmt.Errorf("list.chunk: size must be a representable positive integer")
+	}
+	chunks := make([]any, 0)
 	for i := 0; i < len(list); i += size {
 		end := i + size
 		if end > len(list) {

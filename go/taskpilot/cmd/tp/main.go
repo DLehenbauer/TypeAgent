@@ -1233,20 +1233,9 @@ func printLogEvent(w io.Writer, state string, rec telemetry.SpanRecord) error {
 	return rendererFor(rec).plain(w, state, rec)
 }
 
-// spanKind returns the stable span-kind discriminator. It prefers the explicit
-// AttrSpanKind attribute and falls back to the legacy span name for records
-// written before the attribute existed.
+// spanKind returns the stable span-kind discriminator.
 func spanKind(rec telemetry.SpanRecord) string {
-	if k := attrStr(rec, telemetry.AttrSpanKind); k != "" {
-		return k
-	}
-	switch rec.Name {
-	case telemetry.SpanRun:
-		return telemetry.SpanKindRun
-	case telemetry.SpanNode:
-		return telemetry.SpanKindNode
-	}
-	return ""
+	return attrStr(rec, telemetry.AttrSpanKind)
 }
 
 func printSpanEvents(w io.Writer, rec telemetry.SpanRecord) {

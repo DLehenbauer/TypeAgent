@@ -3,7 +3,7 @@
 
 kind: taskpilot
 version: 1
-requiresEngine: ">=0.1.0 <0.2.0"
+requiresEngine: ">=0.3.0 <0.4.0"
 entry: selfReview
 
 # Multiagent self-review "ratchet" workflow for the taskpilot Go codebase.
